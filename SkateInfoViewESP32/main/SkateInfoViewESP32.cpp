@@ -20,6 +20,9 @@
 #include "esp_log.h"
 #include <string.h>
 #include "esp_system.h"
+#include "driver/ledc.h"
+
+#include "RGB_LED.h"
 
 /* ----------------------------
  * NimBLE / GATT server
@@ -41,13 +44,13 @@ extern "C" {
 static const char *TAG = "skateinfo";
 
 // Hardware mapping - adjust these for your board/pins
-#define HALL_GPIO            GPIO_NUM_4
+#define HALL_GPIO            GPIO_NUM_38
 #define NUM_WHEEL_MAG        6
 
-// ADC channels (placeholders - change to correct ADC channels for your wiring)
-#define ADC_BATT_CHANNEL     ADC_CHANNEL_6  // example: GPIO33 on many ESP32s
-#define ADC_CURR_HS_CHANNEL  ADC_CHANNEL_7  // example
-#define ADC_CURR_LS_CHANNEL  ADC_CHANNEL_4  // example
+
+// ADC channels (update to match new wiring)
+#define ADC_BATT_CHANNEL     ADC_CHANNEL_4  // ADC1_4 is actually IO5. For battery voltage
+#define ADC_CURR_HS_CHANNEL  ADC_CHANNEL_3  // ADC1_3 is actually IO4. For battery current
 
 // Sampling / timings
 #define POLL_MS              300
@@ -148,7 +151,6 @@ static void sensor_task(void *arg)
         };
         ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_BATT_CHANNEL, &chan_cfg));
         ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CURR_HS_CHANNEL, &chan_cfg));
-        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CURR_LS_CHANNEL, &chan_cfg));
     }
 
     last_integration_time_ms = esp_log_timestamp();
@@ -157,17 +159,17 @@ static void sensor_task(void *arg)
         uint32_t now = esp_log_timestamp();
 
         int raw_batt = 0;
-        int raw_curr_hs = 0;
-        int raw_curr_ls = 0;
+        int raw_curr = 0;
         ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_BATT_CHANNEL, &raw_batt));
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CURR_HS_CHANNEL, &raw_curr_hs));
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CURR_LS_CHANNEL, &raw_curr_ls));
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CURR_HS_CHANNEL, &raw_curr));
 
         // Translate raw ADC (0-4095) to approximate values used in original sketch
         // Note: you should calibrate these formulas for your voltage divider and sense resistor
         float battVoltageRaw = (float)raw_batt; // similar to analogRead(A1)
-        float battVoltageCorr = (battVoltageRaw * 1000.0f / 79.125f) + (0.125f * 1000.0f * (raw_curr_hs / 125.0f));
-        float battCurrentmA = (raw_curr_hs - raw_curr_ls) * 1000.0f / 125.0f;
+        float battVoltageCorr = (battVoltageRaw * 1000.0f / 79.125f); // update formula as needed
+        // Battery current calculation for bidirectional amp
+        float battCurrentRaw = (float)raw_curr;
+        float battCurrentmA = ((battCurrentRaw - 2048.0f) * 1000.0f / 125.0f); // 2048 is mid-scale for 12-bit ADC
 
         // integrate mAh
         uint32_t dt_ms = now - last_integration_time_ms;
@@ -446,9 +448,22 @@ extern "C" void app_main(void)
     /* Start sensor and rpm tasks */
     xTaskCreate(rpm_task, "rpm_task", 4096, NULL, 5, NULL);
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+   
 
 #if CONFIG_BT_NIMBLE_ENABLED
     /* Initialize NimBLE and start host task */
     ble_init();
+
 #endif
+
+    // Instantiate the RGB LED (example pins: 6, 7, 8)
+    ILED* rgbLed = new ESP32LED(8, 7, 6);
+
+    RGBColor color{
+        .r = 0,
+        .g = 255,
+        .b = 255
+    };
+
+    rgbLed->setPattern(LEDPattern::Breathe, color);
 }
