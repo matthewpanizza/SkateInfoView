@@ -23,6 +23,7 @@
 #include "driver/ledc.h"
 
 #include "RGB_LED.h"
+#include "TCS34725.h"
 
 /* ----------------------------
  * NimBLE / GATT server
@@ -508,4 +509,16 @@ extern "C" void app_main(void)
     };
     gpio_config(&io_conf_exp_latch);
     gpio_set_level(PWR_LATCH_GPIO, 1);
+
+    TCS34725 tcs(GPIO_NUM_9, GPIO_NUM_10);
+    auto res = tcs.init();
+
+    for(;;){
+        RGBWColor c;
+        tcs.getRawColor(&c);
+    
+        ESP_LOGI("Color", "Color: %d %d %d", c.red, c.green, c.blue);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
 }
