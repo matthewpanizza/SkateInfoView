@@ -7,6 +7,8 @@
 #include "freertos/task.h"
 #include <stdint.h>
 
+void configurePWMPin(int pinNumber, ledc_channel_t channel);
+
 class ESP32LED : public ILED {
 public:
     ESP32LED(int pinR, int pinG, int pinB);

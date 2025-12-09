@@ -45,6 +45,9 @@ static const char *TAG = "skateinfo";
 
 // Hardware mapping - adjust these for your board/pins
 #define HALL_GPIO            GPIO_NUM_38
+#define EXP_5V_GPIO          GPIO_NUM_41
+#define EXP_12V_GPIO         GPIO_NUM_42
+#define PWR_LATCH_GPIO       GPIO_NUM_2
 #define NUM_WHEEL_MAG        6
 
 
@@ -162,11 +165,12 @@ static void sensor_task(void *arg)
         int raw_curr = 0;
         ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_BATT_CHANNEL, &raw_batt));
         ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CURR_HS_CHANNEL, &raw_curr));
+        const float voltDividerRatio = 38.5f;
 
         // Translate raw ADC (0-4095) to approximate values used in original sketch
         // Note: you should calibrate these formulas for your voltage divider and sense resistor
         float battVoltageRaw = (float)raw_batt; // similar to analogRead(A1)
-        float battVoltageCorr = (battVoltageRaw * 1000.0f / 79.125f); // update formula as needed
+        float battVoltageCorr = (battVoltageRaw * 1000.0f / voltDividerRatio); // update formula as needed
         // Battery current calculation for bidirectional amp
         float battCurrentRaw = (float)raw_curr;
         float battCurrentmA = ((battCurrentRaw - 2048.0f) * 1000.0f / 125.0f); // 2048 is mid-scale for 12-bit ADC
@@ -449,6 +453,14 @@ extern "C" void app_main(void)
     xTaskCreate(rpm_task, "rpm_task", 4096, NULL, 5, NULL);
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
    
+    configurePWMPin(15, LEDC_CHANNEL_3);
+    configurePWMPin(16, LEDC_CHANNEL_4);
+
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, 255));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3));
+
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_4, 255));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_4));
 
 #if CONFIG_BT_NIMBLE_ENABLED
     /* Initialize NimBLE and start host task */
@@ -466,4 +478,34 @@ extern "C" void app_main(void)
     };
 
     rgbLed->setPattern(LEDPattern::Breathe, color);
+
+    gpio_config_t io_conf_exp_5V = {
+        .pin_bit_mask = (1ULL << EXP_5V_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf_exp_5V);
+    gpio_set_level(EXP_5V_GPIO, 1);
+
+    gpio_config_t io_conf_exp_12V = {
+        .pin_bit_mask = (1ULL << EXP_12V_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf_exp_12V);
+    gpio_set_level(EXP_12V_GPIO, 1);
+
+    gpio_config_t io_conf_exp_latch = {
+        .pin_bit_mask = (1ULL << PWR_LATCH_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf_exp_latch);
+    gpio_set_level(PWR_LATCH_GPIO, 1);
 }

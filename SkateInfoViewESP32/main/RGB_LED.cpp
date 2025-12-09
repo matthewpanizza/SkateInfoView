@@ -15,6 +15,27 @@
 #define LEDC_CLK_SRC            LEDC_AUTO_CLK
 #define LEDC_FREQUENCY          (4000) // Frequency in Hertz. Set frequency at 4 kHz
 
+void configurePWMPin(int pinNumber, ledc_channel_t channel){
+    static ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .timer_num        = LEDC_TIMER_1,
+        .freq_hz          = LEDC_FREQUENCY,
+        .clk_cfg          = LEDC_CLK_SRC,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num       = pinNumber,
+        .speed_mode     = LEDC_MODE,
+        .channel        = channel,
+        .timer_sel      = ledc_timer.timer_num,
+        .duty           = 0,
+        .hpoint         = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+}
+
 ESP32LED::ESP32LED(int pinR, int pinG, int pinB)
     : rPin(pinR), gPin(pinG), bPin(pinB),
       currentPattern(LEDPattern::Solid),
