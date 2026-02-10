@@ -85,15 +85,13 @@ ESP32LED::ESP32LED(int pinR, int pinG, int pinB)
 }
 
 void ESP32LED::color(const RGBColor& c) {
-    currentColor = c;
-    currentPattern = LEDPattern::Solid;
+    color(c.r, c.g, c.b);
 }
 
 void ESP32LED::color(uint8_t R, uint8_t G, uint8_t B) {
     currentColor.r = R;
     currentColor.g = G;
     currentColor.b = B;
-    currentPattern = LEDPattern::Solid;
 }
 
 void ESP32LED::control(bool enable) {
@@ -110,7 +108,7 @@ void ESP32LED::reset() {
 
 void ESP32LED::setPattern(LEDPattern pattern, const RGBColor& c, PatternSpeed speed) {
     currentPattern = pattern;
-    currentColor = c;
+    color(c.r, c.g, c.b);
     currentSpeed = speed;
 }
 
