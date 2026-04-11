@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "esp_timer.h"
+#include "cJSON.h"
 
 #include "RGB_LED.h"
 #include "TCS34725.h"
@@ -68,11 +69,15 @@ static const char *TAG = "skateinfo";
 #define EXP_12V_GPIO         GPIO_NUM_42
 #define PWR_LATCH_GPIO       GPIO_NUM_2
 #define ESC_PWR_SENSE_GPIO   GPIO_NUM_1
-#define WHEEL_RPM_RATIO_L    12
-#define WHEEL_RPM_RATIO_R    12
-// Wheel diameter in millimeters (used to compute circumference)
-#define WHEEL_SIZE_MM        90
+
+#define HEADLIGHT_OUT_GPIO   GPIO_NUM_15
+#define BRAKELIGHT_OUT_GPIO  GPIO_NUM_16
+
+// Kinematics Macros
+//#define WHEEL_SIZE_MM        90
 #define WHEEL_SIZE_MM        103            // Size of wheel used for speed calculation from RPM. TODO: Configurable in NVS
+#define WHEEL_RPM_RATIO_L    1000
+#define WHEEL_RPM_RATIO_R    170
 
 
 // SPI pins for MCP2515 CAN Controller
@@ -93,8 +98,8 @@ static const char *TAG = "skateinfo";
 #define IDLE_POWEROFF_MS        300000
 
 // Power Macros
-#define BATT_CELL_MIN           3.0         // Voltage at which cell is considered to be 0% charged         
-#define BATT_CELL_MAX           4.10        // Voltage at which cell is considered to be 100% charged
+#define BATT_CELL_MIN           3.1         // Voltage at which cell is considered to be 0% charged         
+#define BATT_CELL_MAX           4.0         // Voltage at which cell is considered to be 100% charged
 #define BATT_CELL_COUNT         12          // Number of series cell in pack. TODO: make this NVS storeable
 
 /* GATT service/characteristic UUIDs (Nordic UART Service).
@@ -130,8 +135,18 @@ static const ble_uuid128_t gatt_chr_tx_uuid_struct = {
 
 // Shared state
 ILED* rgbLed;
-static volatile uint32_t pulse_count_left = 0; // increments from ISR
-static volatile uint32_t pulse_count_right = 0; // increments from ISR
+static volatile uint32_t pulse_count_left_A = 0; // increments from ISR
+static volatile uint32_t pulse_count_left_B = 0; // increments from ISR
+static volatile uint32_t pulse_count_left_C = 0; // increments from ISR
+static volatile uint32_t pulse_count_right_A = 0; // increments from ISR
+static volatile uint32_t pulse_count_right_B = 0; // increments from ISR
+static volatile uint32_t pulse_count_right_C = 0; // increments from ISR
+static volatile uint32_t pulses_left_A = 0;
+static volatile uint32_t pulses_left_B = 0;
+static volatile uint32_t pulses_left_C = 0;
+static volatile uint32_t pulses_right_A = 0;
+static volatile uint32_t pulses_right_B = 0;
+static volatile uint32_t pulses_right_C = 0;
 static uint32_t rev_count_left = 0;
 static uint32_t rev_count_right = 0;
 static uint32_t rpm_left = 0;
@@ -155,6 +170,36 @@ static SemaphoreHandle_t gatt_tx_mutex = NULL;
 static uint8_t gatt_svr_tx_val[512];
 static uint16_t gatt_svr_tx_val_handle = 0;
 
+/* BLE RX message queue structure and handle */
+typedef struct {
+    uint16_t len;
+    uint8_t data[512];
+} ble_rx_message_t;
+
+static QueueHandle_t ble_rx_queue = NULL;
+static const uint16_t BLE_RX_QUEUE_SIZE = 10;
+
+/* Callback function invoked when BLE data is received.
+ * Enqueues the message in a thread-safe queue for processing.
+ */
+static void ble_on_data_received(const uint8_t *data, uint16_t len)
+{
+    if (ble_rx_queue == NULL) {
+        ESP_LOGW(TAG, "BLE RX queue not initialized");
+        return;
+    }
+
+    ble_rx_message_t msg;
+    msg.len = len > sizeof(msg.data) ? sizeof(msg.data) : len;
+    memcpy(msg.data, data, msg.len);
+
+    /* Send to queue with timeout; drop message if queue is full */
+    BaseType_t res = xQueueSend(ble_rx_queue, &msg, pdMS_TO_TICKS(100));
+    if (res != pdPASS) {
+        ESP_LOGW(TAG, "BLE RX queue full, dropping message");
+    }
+}
+
 // ISR for hall pulse
 static void IRAM_ATTR hall_isr_handler(void *arg)
 {
@@ -163,17 +208,28 @@ static void IRAM_ATTR hall_isr_handler(void *arg)
 
     // Compare which pin triggered the ISR and handle accordingly.
     // Only do minimal, ISR-safe work here.
-    if (gpio_num == HALL_LEFT_A_GPIO || 
-        gpio_num == HALL_LEFT_B_GPIO || 
-        gpio_num == HALL_LEFT_C_GPIO) 
+    switch (gpio_num)
     {
-        pulse_count_left++;
-    } 
-    else if (gpio_num == HALL_RIGHT_A_GPIO || 
-             gpio_num == HALL_RIGHT_B_GPIO || 
-             gpio_num == HALL_RIGHT_C_GPIO) 
-    {
-        pulse_count_right++;
+    case HALL_LEFT_A_GPIO:
+        pulse_count_left_A++;
+        break;
+    case HALL_LEFT_B_GPIO:
+        pulse_count_left_B++;
+        break;
+    case HALL_LEFT_C_GPIO:
+        pulse_count_left_C++;
+        break;
+    case HALL_RIGHT_A_GPIO:
+        pulse_count_right_A++;
+        break;
+    case HALL_RIGHT_B_GPIO:
+        pulse_count_right_B++;
+        break;
+    case HALL_RIGHT_C_GPIO:
+        pulse_count_right_C++;
+        break;
+    default:
+        break;
     }
 }
 
@@ -189,7 +245,6 @@ static void ble_notify_placeholder(const char *name, int value)
 static void rpm_task(void *arg)
 {
     (void)arg;
-    uint32_t last_count = 0;
     static int64_t last_time_us = esp_timer_get_time();
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000)); // every second
@@ -200,12 +255,18 @@ static void rpm_task(void *arg)
         last_time_us = now_us;
 
         // atomically get & clear pulse_count (ISR increments pulse_count)
-        uint32_t pulses_left = __atomic_exchange_n(&pulse_count_left, 0U, __ATOMIC_ACQ_REL);
-        uint32_t pulses_right = __atomic_exchange_n(&pulse_count_right, 0U, __ATOMIC_ACQ_REL);
+        pulses_left_A = __atomic_exchange_n(&pulse_count_left_A, 0U, __ATOMIC_ACQ_REL);
+        pulses_left_B = __atomic_exchange_n(&pulse_count_left_B, 0U, __ATOMIC_ACQ_REL);
+        pulses_left_C = __atomic_exchange_n(&pulse_count_left_C, 0U, __ATOMIC_ACQ_REL);
+        pulses_right_A = __atomic_exchange_n(&pulse_count_right_A, 0U, __ATOMIC_ACQ_REL);
+        pulses_right_B = __atomic_exchange_n(&pulse_count_right_B, 0U, __ATOMIC_ACQ_REL);
+        pulses_right_C = __atomic_exchange_n(&pulse_count_right_C, 0U, __ATOMIC_ACQ_REL);
 
         // Compute revolutions during the interval
-        double revs_left = (double)pulses_left / (double)WHEEL_RPM_RATIO_L;
-        double revs_right = (double)pulses_right / (double)WHEEL_RPM_RATIO_R;
+        uint32_t pulses_left_total = pulses_left_A + pulses_left_B + pulses_left_C;
+        uint32_t pulses_right_total = pulses_right_A + pulses_right_B + pulses_right_C;
+        double revs_left = (double)pulses_left_total / (double)WHEEL_RPM_RATIO_L;
+        double revs_right = (double)pulses_right_total / (double)WHEEL_RPM_RATIO_R;
 
         // RPS and RPM
         double rps_left = revs_left / dt_s;
@@ -218,7 +279,7 @@ static void rpm_task(void *arg)
         rev_count_right += (uint32_t)revs_right;
 
         // Average RPM across both wheels
-        avg_rpm = (((double)rpm_left) + ((double)rpm_right)) / 2.0;
+        avg_rpm = rpm_right;//(((double)rpm_left) + ((double)rpm_right)) / 2.0;
 
         // Compute speed (assume WHEEL_SIZE_MM is diameter in mm -> circumference = pi * d)
         double wheel_circ_m = (WHEEL_SIZE_MM / 1000.0) * M_PI;
@@ -327,7 +388,7 @@ static void sensor_task(void *arg)
         //ESP_LOGI(TAG, "battRaw=%d battCorr=%.0f mA=%.1f mAH=%.3f", raw_batt, battVoltageCorr, battCurrentmA, mAH_consumption);
 
         // Send periodic JSON sensor notification over BLE (TX characteristic)
-    #if CONFIG_BT_NIMBLE_ENABLED
+        #if CONFIG_BT_NIMBLE_ENABLED
         {
             char json[192];
             int n = snprintf(json, sizeof(json), "{\"batt_mV\":%.0f,\"curr_mA\":%.1f,\"mAH\":%d,\"soc\":%d,\"trip\":%0.2f,\"mph\":%.1f,\"reva\":%" PRIu32 ",\"rev_l\":%" PRIu32 ",\"rev_r\":%" PRIu32 "}",
@@ -339,10 +400,124 @@ static void sensor_task(void *arg)
             if (gatt_tx_mutex) xSemaphoreGive(gatt_tx_mutex);
             /* notify subscribed centrals */
             ble_gatts_chr_updated(gatt_svr_tx_val_handle);
+
+            static int debug_count = 0;
+            if(debug_count++ == 0){
+                char json2[192];
+                int n = snprintf(json2, sizeof(json2), "{\"p_l_a\":%" PRIu32 ",\"p_l_b\":%" PRIu32 ",\"p_l_c\":%" PRIu32 ",\"p_r_a\":%" PRIu32 ",\"p_r_b\":%" PRIu32 ",\"p_r_c\":%" PRIu32 "}",
+                         pulses_left_A, pulses_left_B, pulses_left_C, pulses_right_A, pulses_right_B, pulses_right_C);
+                copy_len = n > (int)sizeof(gatt_svr_tx_val) - 1 ? (int)sizeof(gatt_svr_tx_val) - 1 : n;
+                if (gatt_tx_mutex) xSemaphoreTake(gatt_tx_mutex, portMAX_DELAY);
+                memcpy(gatt_svr_tx_val, json2, copy_len);
+                gatt_svr_tx_val[copy_len] = '\0';
+                if (gatt_tx_mutex) xSemaphoreGive(gatt_tx_mutex);
+                /* notify subscribed centrals */
+                ble_gatts_chr_updated(gatt_svr_tx_val_handle);
+                
+            }
+            if(debug_count > 5) debug_count = 0;
         }
-    #endif
+        #endif
 
         vTaskDelay(pdMS_TO_TICKS(RPM_POLL_MS));
+    }
+}
+
+/* Handler functions for BLE control commands */
+
+/**
+ * Handler for mode control command
+ * @param mode: string mode value (e.g., "cruise", "sport", etc.)
+ */
+static void modeHandler(const char *mode)
+{
+    ESP_LOGI(TAG, "Mode command received: %s", mode);
+    // TODO: Update global mode state variable
+    // Example: strncpy(current_mode, mode, sizeof(current_mode) - 1);
+}
+
+/**
+ * Handler for headlight control command
+ * @param brightness: 0-255 brightness level
+ */
+static void headlightHandler(uint8_t brightness)
+{
+    ESP_LOGI(TAG, "Headlight command received: brightness=%d", brightness);
+    // TODO: Update global headlight state variable
+    // Example: headlight_brightness = brightness;
+}
+
+/**
+ * Handler for taillight control command
+ * @param brightness: 0-255 brightness level
+ */
+static void taillightHandler(uint8_t brightness)
+{
+    ESP_LOGI(TAG, "Taillight command received: brightness=%d", brightness);
+    // TODO: Update global taillight state variable
+    // Example: taillight_brightness = brightness;
+}
+
+
+
+/**
+ * Process commands from the BLE RX queue
+ * Parses JSON commands using cJSON and dispatches to appropriate handlers
+ * Supports: "hdl" (headlight, 0-255), "tll" (taillight, 0-255), "mode" (string)
+ */
+static void ble_process_command_queue(void)
+{
+    ble_rx_message_t msg;
+
+    /* Non-blocking check for queued messages */
+    if (xQueueReceive(ble_rx_queue, &msg, 0) == pdPASS) {
+        /* Null-terminate the message data */
+        if (msg.len < sizeof(msg.data)) {
+            msg.data[msg.len] = '\0';
+        } else {
+            msg.data[sizeof(msg.data) - 1] = '\0';
+        }
+
+        const char *json_str = (const char *)msg.data;
+        ESP_LOGI(TAG, "Processing command: %s", json_str);
+
+        /* Parse JSON using cJSON */
+        cJSON *root = cJSON_Parse(json_str);
+        if (root == NULL) {
+            ESP_LOGW(TAG, "Failed to parse JSON: %s", json_str);
+            return;
+        }
+
+        /* Handle headlight (hdl) command */
+        cJSON *hdl_item = cJSON_GetObjectItem(root, "hdl");
+        if (hdl_item != NULL && cJSON_IsNumber(hdl_item)) {
+            int hdl_value = hdl_item->valueint;
+            if (hdl_value >= 0 && hdl_value <= 255) {
+                headlightHandler((uint8_t)hdl_value);
+            } else {
+                ESP_LOGW(TAG, "Invalid headlight value: %d", hdl_value);
+            }
+        }
+
+        /* Handle taillight (tll) command */
+        cJSON *tll_item = cJSON_GetObjectItem(root, "tll");
+        if (tll_item != NULL && cJSON_IsNumber(tll_item)) {
+            int tll_value = tll_item->valueint;
+            if (tll_value >= 0 && tll_value <= 255) {
+                taillightHandler((uint8_t)tll_value);
+            } else {
+                ESP_LOGW(TAG, "Invalid taillight value: %d", tll_value);
+            }
+        }
+
+        /* Handle mode command */
+        cJSON *mode_item = cJSON_GetObjectItem(root, "mode");
+        if (mode_item != NULL && cJSON_IsString(mode_item)) {
+            modeHandler(mode_item->valuestring);
+        }
+
+        /* Clean up cJSON object */
+        cJSON_Delete(root);
     }
 }
 
@@ -361,8 +536,11 @@ static void power_control_task(void *arg){
     static TickType_t last_esc_on_time = xTaskGetTickCount();
 
     while(1){
-        //esc_powered = gpio_get_level(ESC_PWR_SENSE_GPIO);
-        esc_powered = (rpm_left > 0) || (rpm_right > 0);
+        /* Process any pending BLE control commands */
+        ble_process_command_queue();
+
+        esc_powered = gpio_get_level(ESC_PWR_SENSE_GPIO);
+        //esc_powered = (rpm_left > 0) || (rpm_right > 0);
 
         if(esc_powered){
             color.b = 255;
@@ -458,6 +636,9 @@ static int gatt_svr_chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
             gatt_svr_tx_val[len] = '\0';
             ESP_LOGI(TAG, "BLE RX: %s", (char*)gatt_svr_tx_val);
 
+            /* Enqueue the received data for processing by another task */
+            ble_on_data_received(gatt_svr_tx_val, len);
+
             /* Create an ACK JSON and notify back on TX characteristic */
             char resp[128];
             int r = snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"len\":%d}", (int)len);
@@ -504,6 +685,8 @@ void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg)
     }
 }
 
+static int ble_gap_event_cb(struct ble_gap_event *event, void *arg);
+
 static void ble_app_advertise(void)
 {
     struct ble_gap_adv_params adv_params;
@@ -537,11 +720,34 @@ static void ble_app_advertise(void)
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_params, NULL, NULL);
+    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "error enabling advertisement; rc=%d", rc);
         return;
     }
+}
+
+/* GAP event callback: handle connect/disconnect and restart advertising on disconnect */
+static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0) {
+                ESP_LOGI(TAG, "BLE connected (conn_handle=%d)", event->connect.conn_handle);
+            } else {
+                ESP_LOGW(TAG, "BLE connection failed; status=%d", event->connect.status);
+            }
+            break;
+        case BLE_GAP_EVENT_DISCONNECT:
+            ESP_LOGI(TAG, "BLE disconnected (conn_handle=%d), reason=%d", event->disconnect.conn.conn_handle, event->disconnect.reason);
+            /* Restart advertising so centrals can reconnect */
+            ble_app_advertise();
+            break;
+        default:
+            break;
+    }
+    return 0;
 }
 
 static void ble_app_on_sync(void)
@@ -761,16 +967,17 @@ extern "C" void app_main(void)
     /* Create resources */
     pulse_mutex = xSemaphoreCreateMutex();
     gatt_tx_mutex = xSemaphoreCreateMutex();
+    ble_rx_queue = xQueueCreate(BLE_RX_QUEUE_SIZE, sizeof(ble_rx_message_t));
 
     // Initialize UART for ISO communications (uses `UART_ISO_TX`/`UART_ISO_RX`)
     uart_iso_init();
 
     configureHallGPIO(HALL_LEFT_A_GPIO);
-    configureHallGPIO(HALL_LEFT_B_GPIO);
-    configureHallGPIO(HALL_LEFT_C_GPIO);
+    //configureHallGPIO(HALL_LEFT_B_GPIO);
+    //configureHallGPIO(HALL_LEFT_C_GPIO);
     configureHallGPIO(HALL_RIGHT_A_GPIO);
-    configureHallGPIO(HALL_RIGHT_B_GPIO);
-    configureHallGPIO(HALL_RIGHT_C_GPIO);
+    //configureHallGPIO(HALL_RIGHT_B_GPIO);
+    //configureHallGPIO(HALL_RIGHT_C_GPIO);
 
     configurePowerSenseGPIO(ESC_PWR_SENSE_GPIO);
 
@@ -779,8 +986,8 @@ extern "C" void app_main(void)
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
     xTaskCreate(power_control_task, "power_control_Task", 4096, NULL, 6, NULL);
    
-    configurePWMPin(15, LEDC_CHANNEL_3);
-    configurePWMPin(16, LEDC_CHANNEL_4);
+    configurePWMPin(HEADLIGHT_OUT_GPIO, LEDC_CHANNEL_3);
+    configurePWMPin(BRAKELIGHT_OUT_GPIO, LEDC_CHANNEL_4);
 
     ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, 0));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3));

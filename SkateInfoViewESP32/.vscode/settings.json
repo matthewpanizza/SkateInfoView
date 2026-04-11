@@ -5,7 +5,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.port": "/dev/tty.usbmodem12101",
+  "idf.port": "/dev/tty.usbmodem101",
   "idf.toolsPath": "/Users/matthewpanizza/.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
@@ -23,5 +23,6 @@
     "gpio.h": "c",
     "stdio.h": "c",
     "adc.h": "c"
-  }
+  },
+  "idf.currentSetup": "/Users/matthewpanizza/esp/v5.4.2/esp-idf"
 }
