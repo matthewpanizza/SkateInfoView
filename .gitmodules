@@ -1,0 +1,3 @@
+[submodule "SkateInfoViewESP32/main/Pizzatronix_Common"]
+	path = SkateInfoViewESP32/main/Pizzatronix_Common
+	url = https://github.com/matthewpanizza/Pizzatronix_Common.git

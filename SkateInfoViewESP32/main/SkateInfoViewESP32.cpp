@@ -29,6 +29,7 @@
 #include <math.h>
 #include "esp_timer.h"
 #include "cJSON.h"
+#include "Pizzatronix.h"
 
 #include "RGB_LED.h"
 #include "TCS34725.h"
@@ -986,8 +987,8 @@ extern "C" void app_main(void)
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
     xTaskCreate(power_control_task, "power_control_Task", 4096, NULL, 6, NULL);
    
-    configurePWMPin(HEADLIGHT_OUT_GPIO, LEDC_CHANNEL_3);
-    configurePWMPin(BRAKELIGHT_OUT_GPIO, LEDC_CHANNEL_4);
+    ESP32LED::configurePWMPin(HEADLIGHT_OUT_GPIO, LEDC_CHANNEL_3);
+    ESP32LED::configurePWMPin(BRAKELIGHT_OUT_GPIO, LEDC_CHANNEL_4);
 
     ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, 0));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3));
