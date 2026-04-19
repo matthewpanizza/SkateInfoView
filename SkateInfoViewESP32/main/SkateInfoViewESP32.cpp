@@ -684,6 +684,7 @@ static void configureHallGPIO(gpio_num_t gpio){
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Starting SkateInfoView ESP32-S3");
+    esp_ota_mark_app_valid_cancel_rollback();
 
     /* Create resources */
     pulse_mutex = xSemaphoreCreateMutex();
