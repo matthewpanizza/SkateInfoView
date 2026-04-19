@@ -35,22 +35,7 @@
 #include "TCS34725.h"
 #include "mcp_can.h"
 
-/* ----------------------------
- * NimBLE / GATT server
- * ---------------------------- */
 
-#if CONFIG_BT_NIMBLE_ENABLED
-extern "C" {
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
-#include "host/ble_hs.h"
-#include "host/ble_uuid.h"
-#include "host/ble_gatt.h"
-#include "host/util/util.h"
-#include "services/gap/ble_svc_gap.h"
-#include "services/gatt/ble_svc_gatt.h"
-}
-#endif
 
 static const char *TAG = "skateinfo";
 
@@ -103,36 +88,16 @@ static const char *TAG = "skateinfo";
 #define BATT_CELL_MAX           4.0         // Voltage at which cell is considered to be 100% charged
 #define BATT_CELL_COUNT         12          // Number of series cell in pack. TODO: make this NVS storeable
 
-/* GATT service/characteristic UUIDs (Nordic UART Service).
- * Service: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
- * RX char (write from central): 6E400002-B5A3-F393-E0A9-E50E24DCCA9E
- * TX char (notify from peripheral): 6E400003-B5A3-F393-E0A9-E50E24DCCA9E
- */
-#define GATT_SVC_UUID_STR       "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define GATT_CHR_RX_UUID_STR    "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-#define GATT_CHR_TX_UUID_STR    "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
-
 #if CONFIG_BT_NIMBLE_ENABLED
-/* Statically allocate BLE UUID structures for C++ compilation. The
- * original IDF macros use C compound literals and take their address,
- * which is not allowed in C++. Declare static constants and use their
- * addresses instead.
- * Nordic UART Service uses 128-bit UUIDs.
- */
-static const ble_uuid128_t gatt_svc_uuid_struct = {
-    .u = { .type = BLE_UUID_TYPE_128 },
-    .value = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00, 0x40, 0x6E}
-};
-static const ble_uuid128_t gatt_chr_rx_uuid_struct = {
-    .u = { .type = BLE_UUID_TYPE_128 },
-    .value = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x02, 0x00, 0x40, 0x6E}
-};
-static const ble_uuid128_t gatt_chr_tx_uuid_struct = {
-    .u = { .type = BLE_UUID_TYPE_128 },
-    .value = {0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x03, 0x00, 0x40, 0x6E}
-};
-#endif
+/* Main BLE Stack - initializes advertising and services */
+BLEStack ble("SK01");
 
+/* UART/Telemetry Service instance - initialized during BLE setup */
+static BLEUARTService uart_service;
+
+/* OTA Service instance - initialized during BLE setup */
+static BLEOTAService ota_service;
+#endif
 
 // Shared state
 ILED* rgbLed;
@@ -165,11 +130,6 @@ static SemaphoreHandle_t pulse_mutex = NULL;
 static adc_oneshot_unit_handle_t adc_handle = NULL;
 static SemaphoreHandle_t gatt_tx_mutex = NULL;
 
-/* GATT TX buffer and handle (declared early so sensor_task can use it when
- * BLE is enabled). The actual GATT registration will set the value handle.
- */
-static uint8_t gatt_svr_tx_val[512];
-static uint16_t gatt_svr_tx_val_handle = 0;
 
 /* BLE RX message queue structure and handle */
 typedef struct {
@@ -179,27 +139,6 @@ typedef struct {
 
 static QueueHandle_t ble_rx_queue = NULL;
 static const uint16_t BLE_RX_QUEUE_SIZE = 10;
-
-/* Callback function invoked when BLE data is received.
- * Enqueues the message in a thread-safe queue for processing.
- */
-static void ble_on_data_received(const uint8_t *data, uint16_t len)
-{
-    if (ble_rx_queue == NULL) {
-        ESP_LOGW(TAG, "BLE RX queue not initialized");
-        return;
-    }
-
-    ble_rx_message_t msg;
-    msg.len = len > sizeof(msg.data) ? sizeof(msg.data) : len;
-    memcpy(msg.data, data, msg.len);
-
-    /* Send to queue with timeout; drop message if queue is full */
-    BaseType_t res = xQueueSend(ble_rx_queue, &msg, pdMS_TO_TICKS(100));
-    if (res != pdPASS) {
-        ESP_LOGW(TAG, "BLE RX queue full, dropping message");
-    }
-}
 
 // ISR for hall pulse
 static void IRAM_ATTR hall_isr_handler(void *arg)
@@ -232,15 +171,6 @@ static void IRAM_ATTR hall_isr_handler(void *arg)
     default:
         break;
     }
-}
-
-// Placeholder: notify connected BLE peers for a characteristic
-static void ble_notify_placeholder(const char *name, int value)
-{
-    // Implement NimBLE/BT GATT notification here. This function is a stub
-    // so the project builds without BLE and gives a clear hook for later.
-    (void)name;
-    (void)value;
 }
 
 static void rpm_task(void *arg)
@@ -388,37 +318,8 @@ static void sensor_task(void *arg)
 
         //ESP_LOGI(TAG, "battRaw=%d battCorr=%.0f mA=%.1f mAH=%.3f", raw_batt, battVoltageCorr, battCurrentmA, mAH_consumption);
 
-        // Send periodic JSON sensor notification over BLE (TX characteristic)
-        #if CONFIG_BT_NIMBLE_ENABLED
-        {
-            char json[192];
-            int n = snprintf(json, sizeof(json), "{\"batt_mV\":%.0f,\"curr_mA\":%.1f,\"mAH\":%d,\"soc\":%d,\"trip\":%0.2f,\"mph\":%.1f,\"reva\":%" PRIu32 ",\"rev_l\":%" PRIu32 ",\"rev_r\":%" PRIu32 "}",
-                     battVoltageCorr, battCurrentmA, (int)mAH_consumption, state_of_charge, trip_distance_miles, speed_mph, avg_rpm, rpm_left, rpm_right);
-            int copy_len = n > (int)sizeof(gatt_svr_tx_val) - 1 ? (int)sizeof(gatt_svr_tx_val) - 1 : n;
-            if (gatt_tx_mutex) xSemaphoreTake(gatt_tx_mutex, portMAX_DELAY);
-            memcpy(gatt_svr_tx_val, json, copy_len);
-            gatt_svr_tx_val[copy_len] = '\0';
-            if (gatt_tx_mutex) xSemaphoreGive(gatt_tx_mutex);
-            /* notify subscribed centrals */
-            ble_gatts_chr_updated(gatt_svr_tx_val_handle);
-
-            static int debug_count = 0;
-            if(debug_count++ == 0){
-                char json2[192];
-                int n = snprintf(json2, sizeof(json2), "{\"p_l_a\":%" PRIu32 ",\"p_l_b\":%" PRIu32 ",\"p_l_c\":%" PRIu32 ",\"p_r_a\":%" PRIu32 ",\"p_r_b\":%" PRIu32 ",\"p_r_c\":%" PRIu32 "}",
-                         pulses_left_A, pulses_left_B, pulses_left_C, pulses_right_A, pulses_right_B, pulses_right_C);
-                copy_len = n > (int)sizeof(gatt_svr_tx_val) - 1 ? (int)sizeof(gatt_svr_tx_val) - 1 : n;
-                if (gatt_tx_mutex) xSemaphoreTake(gatt_tx_mutex, portMAX_DELAY);
-                memcpy(gatt_svr_tx_val, json2, copy_len);
-                gatt_svr_tx_val[copy_len] = '\0';
-                if (gatt_tx_mutex) xSemaphoreGive(gatt_tx_mutex);
-                /* notify subscribed centrals */
-                ble_gatts_chr_updated(gatt_svr_tx_val_handle);
-                
-            }
-            if(debug_count > 5) debug_count = 0;
-        }
-        #endif
+        /* Store current sensor values for telemetry task */
+        /* (These are static globals used by ble_telemetry_task) */
 
         vTaskDelay(pdMS_TO_TICKS(RPM_POLL_MS));
     }
@@ -574,252 +475,71 @@ static void power_control_task(void *arg){
 
 #if CONFIG_BT_NIMBLE_ENABLED
 
-/* Forward declarations */
-static int gatt_svr_chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
-                                  struct ble_gatt_access_ctxt *ctxt, void *arg);
-static void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg);
-
-/* GATT service definition */
-static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
-    {
-        .type = BLE_GATT_SVC_TYPE_PRIMARY,
-        .uuid = (ble_uuid_t *)&gatt_svc_uuid_struct,
-        .characteristics = (struct ble_gatt_chr_def[]) {
-            {
-                .uuid = (ble_uuid_t *)&gatt_chr_rx_uuid_struct,
-                .access_cb = gatt_svr_chr_access_cb,
-                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
-            },
-            {
-                .uuid = (ble_uuid_t *)&gatt_chr_tx_uuid_struct,
-                .access_cb = gatt_svr_chr_access_cb,
-                .flags = BLE_GATT_CHR_F_NOTIFY,
-                .val_handle = &gatt_svr_tx_val_handle,
-            },
-            {
-                0
-            }
-        }
-    },
-    {
-        0
-    }
-};
-
-/* Utility to copy ombuf to flat buffer */
-static int gatt_svr_write(struct os_mbuf *om, uint16_t min_len, uint16_t max_len, void *dst, uint16_t *out_len)
+/* Process BLE command JSON and update device parameters */
+static void ble_process_command(const char *json_str)
 {
-    int rc;
-    uint16_t om_len = OS_MBUF_PKTLEN(om);
-    if (om_len < min_len || om_len > max_len) {
-        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-    }
-    rc = ble_hs_mbuf_to_flat(om, dst, max_len, out_len);
-    if (rc != 0) {
-        return BLE_ATT_ERR_UNLIKELY;
-    }
-    return 0;
-}
+    ESP_LOGI(TAG, "Processing BLE command: %s", json_str);
 
-static int gatt_svr_chr_access_cb(uint16_t conn_handle, uint16_t attr_handle,
-                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
-{
-    int rc;
-    const ble_uuid_t *uuid = ctxt->chr->uuid;
-
-    switch (ctxt->op) {
-        case BLE_GATT_ACCESS_OP_WRITE_CHR: {
-            /* Received data from central */
-            uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-            if (len > sizeof(gatt_svr_tx_val) - 1) len = sizeof(gatt_svr_tx_val) - 1;
-            rc = gatt_svr_write(ctxt->om, 0, sizeof(gatt_svr_tx_val) - 1, gatt_svr_tx_val, &len);
-            if (rc != 0) return rc;
-            gatt_svr_tx_val[len] = '\0';
-            ESP_LOGI(TAG, "BLE RX: %s", (char*)gatt_svr_tx_val);
-
-            /* Enqueue the received data for processing by another task */
-            ble_on_data_received(gatt_svr_tx_val, len);
-
-            /* Create an ACK JSON and notify back on TX characteristic */
-            char resp[128];
-            int r = snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"len\":%d}", (int)len);
-            if (r > 0) {
-                /* copy to the tx value storage (protect with mutex) */
-                int copy_len = r > (int)sizeof(gatt_svr_tx_val)-1 ? (int)sizeof(gatt_svr_tx_val)-1 : r;
-                if (gatt_tx_mutex) xSemaphoreTake(gatt_tx_mutex, portMAX_DELAY);
-                memcpy(gatt_svr_tx_val, resp, copy_len);
-                gatt_svr_tx_val[copy_len] = '\0';
-                if (gatt_tx_mutex) xSemaphoreGive(gatt_tx_mutex);
-                /* notify subscribed centrals */
-                ble_gatts_chr_updated(gatt_svr_tx_val_handle);
-            }
-            return 0;
-        }
-        case BLE_GATT_ACCESS_OP_READ_CHR: {
-            /* If central reads a characteristic, supply current TX value */
-            if (attr_handle == gatt_svr_tx_val_handle) {
-                rc = os_mbuf_append(ctxt->om, gatt_svr_tx_val, strlen((char*)gatt_svr_tx_val));
-                return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
-            }
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-        default:
-            return BLE_ATT_ERR_UNLIKELY;
-    }
-}
-
-void gatt_svr_register_cb(struct ble_gatt_register_ctxt *ctxt, void *arg)
-{
-    char buf[BLE_UUID_STR_LEN];
-    switch (ctxt->op) {
-        case BLE_GATT_REGISTER_OP_SVC:
-            ESP_LOGI(TAG, "registered service %s with handle=%d", ble_uuid_to_str(ctxt->svc.svc_def->uuid, buf), ctxt->svc.handle);
-            break;
-        case BLE_GATT_REGISTER_OP_CHR:
-            ESP_LOGI(TAG, "registering characteristic %s def_handle=%d val_handle=%d", ble_uuid_to_str(ctxt->chr.chr_def->uuid, buf), ctxt->chr.def_handle, ctxt->chr.val_handle);
-            break;
-        case BLE_GATT_REGISTER_OP_DSC:
-            ESP_LOGI(TAG, "registering descriptor %s handle=%d", ble_uuid_to_str(ctxt->dsc.dsc_def->uuid, buf), ctxt->dsc.handle);
-            break;
-        default:
-            break;
-    }
-}
-
-static int ble_gap_event_cb(struct ble_gap_event *event, void *arg);
-
-static void ble_app_advertise(void)
-{
-    struct ble_gap_adv_params adv_params;
-    struct ble_hs_adv_fields fields;
-    int rc;
-
-    memset(&fields, 0, sizeof(fields));
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.tx_pwr_lvl_is_present = 1;
-    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-
-    /* Advertise our 128-bit service UUID */
-    static const ble_uuid128_t adv_uuids[] = { gatt_svc_uuid_struct };
-    fields.uuids128 = (ble_uuid128_t *)adv_uuids;
-    fields.num_uuids128 = 1;
-    fields.uuids128_is_complete = 1;
-
-    /* Device name */
-    const char *name = "SK01";
-    fields.name = (uint8_t *)name;
-    fields.name_len = strlen(name);
-    fields.name_is_complete = 1;
-
-    rc = ble_gap_adv_set_fields(&fields);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "error setting advertisement data; rc=%d", rc);
+    if (ble_rx_queue == NULL) {
+        ESP_LOGW(TAG, "BLE RX queue not initialized");
         return;
     }
 
-    memset(&adv_params, 0, sizeof(adv_params));
-    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
-    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    ble_rx_message_t msg;
+    size_t len = strlen(json_str);
+    msg.len = len > sizeof(msg.data) ? sizeof(msg.data) : len;
+    memcpy(msg.data, json_str, msg.len);
 
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event_cb, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "error enabling advertisement; rc=%d", rc);
-        return;
+    /* Send to queue with timeout; drop message if queue is full */
+    BaseType_t res = xQueueSend(ble_rx_queue, &msg, pdMS_TO_TICKS(100));
+    if (res != pdPASS) {
+        ESP_LOGW(TAG, "BLE RX queue full, dropping message");
     }
 }
 
-/* GAP event callback: handle connect/disconnect and restart advertising on disconnect */
-static int ble_gap_event_cb(struct ble_gap_event *event, void *arg)
+/* Initialize NimBLE and register GATT services */
+static void ble_init(void)
+{  
+    /* Initialize UART/Telemetry service */
+    uart_service.setReceiveCallback(ble_process_command);
+    
+    /* Initialize OTA service */
+    ota_service.setStartCallback([](uint32_t expected_size) {
+        ESP_LOGI(TAG, "OTA Start: expecting %lu bytes", expected_size);
+    });
+    ota_service.setProgressCallback([](uint32_t received, uint32_t total) {
+        ESP_LOGD(TAG, "OTA Progress: %lu/%lu bytes", received, total);
+    });
+    ota_service.setFinishCallback([](bool success, const char* error_msg) {
+        if (success) {
+            ESP_LOGI(TAG, "OTA finished successfully, device will reboot");
+        } else {
+            ESP_LOGE(TAG, "OTA failed: %s", error_msg ? error_msg : "unknown error");
+        }
+    });
+
+    ble.init({ &uart_service, &ota_service });
+    
+}
+
+/* Task to broadcast telemetry data as JSON */
+static void ble_telemetry_task(void *arg)
 {
     (void)arg;
-    switch (event->type) {
-        case BLE_GAP_EVENT_CONNECT:
-            if (event->connect.status == 0) {
-                ESP_LOGI(TAG, "BLE connected (conn_handle=%d)", event->connect.conn_handle);
-            } else {
-                ESP_LOGW(TAG, "BLE connection failed; status=%d", event->connect.status);
-            }
-            break;
-        case BLE_GAP_EVENT_DISCONNECT:
-            ESP_LOGI(TAG, "BLE disconnected (conn_handle=%d), reason=%d", event->disconnect.conn.conn_handle, event->disconnect.reason);
-            /* Restart advertising so centrals can reconnect */
-            ble_app_advertise();
-            break;
-        default:
-            break;
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for BLE to initialize
+
+    while (1) {
+        /* Create JSON telemetry object with current sensor data */
+        char json[192];
+        int n = snprintf(json, sizeof(json), "{\"mAH\":%d,\"soc\":%d,\"trip\":%0.2f,\"mph\":%.1f,\"reva\":%" PRIu32 ",\"rev_l\":%" PRIu32 ",\"rev_r\":%" PRIu32 "}",
+                 (int)mAH_consumption, state_of_charge, trip_distance_miles, speed_mph, avg_rpm, rpm_left, rpm_right);
+
+        /* Send telemetry via UART service */
+        uart_service.sendTelemetry(json);
+
+        /* Broadcast every 500ms */
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
-    return 0;
-}
-
-static void ble_app_on_sync(void)
-{
-    int rc;
-    rc = ble_hs_util_ensure_addr(0);
-    assert(rc == 0);
-
-    /* Use public address type */
-    uint8_t own_addr_type = BLE_OWN_ADDR_PUBLIC;
-    rc = ble_hs_id_infer_auto(0, &own_addr_type);
-    assert(rc == 0);
-
-    /* Set name */
-    ble_svc_gap_device_name_set("SK01");
-
-    /* Start advertising */
-    ble_app_advertise();
-}
-
-static void ble_host_task(void *param)
-{
-    ESP_LOGI(TAG, "NimBLE host task started");
-    nimble_port_run();
-    nimble_port_freertos_deinit();
-}
-
-/* Initialize NimBLE and register GATT services (only compiled when NimBLE enabled) */
-static void ble_init(void)
-{
-    int rc;
-    esp_err_t ret;
-
-    ESP_LOGI(TAG, "Initializing NimBLE");
-
-    /* Initialize NVS (required by BLE) */
-    ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    /* Initialize NimBLE stack */
-    ret = nimble_port_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to init nimble %d", ret);
-        return;
-    }
-
-    /* Configure NimBLE host callbacks */
-    ble_hs_cfg.reset_cb = NULL;
-    ble_hs_cfg.sync_cb = ble_app_on_sync;
-    ble_hs_cfg.gatts_register_cb = gatt_svr_register_cb;
-
-    /* Initialize GATT services */
-    ble_svc_gap_init();
-    ble_svc_gatt_init();
-    rc = ble_gatts_count_cfg(gatt_svr_svcs);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gatts_count_cfg failed %d", rc);
-        return;
-    }
-    rc = ble_gatts_add_svcs(gatt_svr_svcs);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gatts_add_svcs failed %d", rc);
-        return;
-    }
-
-    /* Start the NimBLE host in its own RTOS task */
-    nimble_port_freertos_init(ble_host_task);
 }
 
 #endif /* CONFIG_BT_NIMBLE_ENABLED */
@@ -967,7 +687,6 @@ extern "C" void app_main(void)
 
     /* Create resources */
     pulse_mutex = xSemaphoreCreateMutex();
-    gatt_tx_mutex = xSemaphoreCreateMutex();
     ble_rx_queue = xQueueCreate(BLE_RX_QUEUE_SIZE, sizeof(ble_rx_message_t));
 
     // Initialize UART for ISO communications (uses `UART_ISO_TX`/`UART_ISO_RX`)
@@ -997,9 +716,9 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_4));
 
 #if CONFIG_BT_NIMBLE_ENABLED
-    /* Initialize NimBLE and start host task */
+    /* Initialize BLE and start telemetry task */
     ble_init();
-
+    xTaskCreate(ble_telemetry_task, "ble_telemetry_task", 4096, NULL, 5, NULL);
 #endif
 
     
