@@ -34,6 +34,8 @@
 #include "RGB_LED.h"
 #include "TCS34725.h"
 #include "mcp_can.h"
+#include "TMP117.h"
+#include "driver/i2c_master.h"
 
 
 
@@ -50,6 +52,9 @@ static const char *TAG = "skateinfo";
 
 #define UART_ISO_TX          GPIO_NUM_37
 #define UART_ISO_RX          GPIO_NUM_36
+
+#define I2C_SDA              GPIO_NUM_10
+#define I2C_SCL              GPIO_NUM_9
 
 #define EXP_5V_GPIO          GPIO_NUM_41
 #define EXP_12V_GPIO         GPIO_NUM_42
@@ -129,6 +134,11 @@ static SemaphoreHandle_t pulse_mutex = NULL;
 // ADC handle for esp-idf v5 oneshot API
 static adc_oneshot_unit_handle_t adc_handle = NULL;
 static SemaphoreHandle_t gatt_tx_mutex = NULL;
+
+// I2C and Temperature sensor
+static i2c_master_bus_handle_t i2c_bus_handle = NULL;
+static TMP117* tmp117_sensor = NULL;
+static float device_temperature_c = 0.0f;
 
 
 /* BLE RX message queue structure and handle */
@@ -425,7 +435,7 @@ static void ble_process_command_queue(void)
 
 static void power_control_task(void *arg){
     // Instantiate the RGB LED (example pins: 6, 7, 8)
-    rgbLed = new ESP32LED(8, 7, 6);
+    rgbLed = new ESP32LED(8, 47, 48);
 
     RGBColor color{
         .r = 0,
@@ -433,7 +443,7 @@ static void power_control_task(void *arg){
         .b = 0
     };
 
-    rgbLed->setPattern(LEDPattern::Breathe, color);
+    rgbLed->setState(LEDPattern::Breathe, color);
 
     static TickType_t last_esc_on_time = xTaskGetTickCount();
 
@@ -465,7 +475,7 @@ static void power_control_task(void *arg){
             }
         }
 
-        rgbLed->setPattern(LEDPattern::Breathe, color);
+        rgbLed->setState(LEDPattern::Breathe, color);
 
         vTaskDelay(pdMS_TO_TICKS(PWR_POLL_MS));
     }
@@ -530,9 +540,9 @@ static void ble_telemetry_task(void *arg)
 
     while (1) {
         /* Create JSON telemetry object with current sensor data */
-        char json[192];
-        int n = snprintf(json, sizeof(json), "{\"mAH\":%d,\"soc\":%d,\"trip\":%0.2f,\"mph\":%.1f,\"reva\":%" PRIu32 ",\"rev_l\":%" PRIu32 ",\"rev_r\":%" PRIu32 "}",
-                 (int)mAH_consumption, state_of_charge, trip_distance_miles, speed_mph, avg_rpm, rpm_left, rpm_right);
+        char json[256];
+        int n = snprintf(json, sizeof(json), "{\"mAH\":%d,\"soc\":%d,\"trip\":%0.2f,\"mph\":%.1f,\"reva\":%" PRIu32 ",\"rev_l\":%" PRIu32 ",\"rev_r\":%" PRIu32 ",\"temp\":%.2f}",
+                 (int)mAH_consumption, state_of_charge, trip_distance_miles, speed_mph, avg_rpm, rpm_left, rpm_right, device_temperature_c);
 
         /* Send telemetry via UART service */
         uart_service.sendTelemetry(json);
@@ -583,13 +593,13 @@ static spi_device_handle_t spi_mcp2515_init(void)
 
     // Configure CS pin as output (SPI driver should handle it, but ensure it's set up)
     gpio_config_t dig_conf = {};
-    dig_conf.pin_bit_mask = (1ULL << GPIO_NUM_10);
+    dig_conf.pin_bit_mask = (1ULL << SPI_CS_PIN);
     dig_conf.mode = GPIO_MODE_OUTPUT;
     dig_conf.pull_up_en = GPIO_PULLUP_DISABLE;
     dig_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     dig_conf.intr_type = GPIO_INTR_DISABLE;
     gpio_config(&dig_conf);
-    gpio_set_level(GPIO_NUM_10, 0);  // CS high initially (inactive)
+    gpio_set_level(SPI_CS_PIN, 0);  // CS high initially (inactive)
 
     return handle;
 }
@@ -692,6 +702,40 @@ extern "C" void app_main(void)
 
     // Initialize UART for ISO communications (uses `UART_ISO_TX`/`UART_ISO_RX`)
     uart_iso_init();
+
+    // Initialize I2C bus (SDA on IO10, SCL on IO9) for TMP117 and SSD1306 OLED
+    i2c_master_bus_config_t i2c_mst_config = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = I2C_SDA,
+        .scl_io_num = I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags = {
+            .enable_internal_pullup = true,
+        },
+    };
+    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &i2c_bus_handle));
+    ESP_LOGI(TAG, "I2C bus created on I2C_NUM_0 (SDA=IO10, SCL=IO9)");
+
+    // Longer delay to ensure I2C bus is ready
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Probe I2C bus first to verify hardware is present
+    esp_err_t probe_ret = i2c_master_probe(i2c_bus_handle, 0x48, -1);
+    if (probe_ret != ESP_OK) {
+        ESP_LOGW(TAG, "I2C probe failed for TMP117 at 0x48: %s (device may not be connected)", esp_err_to_name(probe_ret));
+    } else {
+        ESP_LOGI(TAG, "I2C probe successful - TMP117 device found at 0x48");
+    }
+
+    // Initialize TMP117 temperature sensor on shared I2C bus
+    tmp117_sensor = new TMP117(i2c_bus_handle, 0x48);  // Default TMP117 address
+    esp_err_t tmp117_ret = tmp117_sensor->init();
+    if (tmp117_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to initialize TMP117 sensor: %s", esp_err_to_name(tmp117_ret));
+    } else {
+        ESP_LOGI(TAG, "TMP117 temperature sensor initialized successfully");
+    }
 
     configureHallGPIO(HALL_LEFT_A_GPIO);
     //configureHallGPIO(HALL_LEFT_B_GPIO);
