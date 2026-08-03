@@ -28,12 +28,13 @@
 #include <stdlib.h>
 #include <math.h>
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "cJSON.h"
 #include "Pizzatronix.h"
 
 #include "RGB_LED.h"
 #include "TCS34725.h"
-#include "mcp_can.h"
+#include "MCP2515_CANController.h"
 #include "TMP117.h"
 #include "driver/i2c_master.h"
 
@@ -42,27 +43,29 @@
 static const char *TAG = "skateinfo";
 
 // Hardware mapping - adjust these for your board/pins
-#define HALL_LEFT_A_GPIO     GPIO_NUM_40
-#define HALL_LEFT_B_GPIO     GPIO_NUM_39
-#define HALL_LEFT_C_GPIO     GPIO_NUM_38
+#define HALL_LEFT_A_GPIO        GPIO_NUM_40
+#define HALL_LEFT_B_GPIO        GPIO_NUM_39
+#define HALL_LEFT_C_GPIO        GPIO_NUM_38
 
-#define HALL_RIGHT_A_GPIO     GPIO_NUM_21
-#define HALL_RIGHT_B_GPIO     GPIO_NUM_18
-#define HALL_RIGHT_C_GPIO     GPIO_NUM_17
+#define HALL_RIGHT_A_GPIO       GPIO_NUM_21
+#define HALL_RIGHT_B_GPIO       GPIO_NUM_18
+#define HALL_RIGHT_C_GPIO       GPIO_NUM_17
 
-#define UART_ISO_TX          GPIO_NUM_37
-#define UART_ISO_RX          GPIO_NUM_36
+#define UART_ISO_TX             GPIO_NUM_37
+#define UART_ISO_RX             GPIO_NUM_36
 
-#define I2C_SDA              GPIO_NUM_10
-#define I2C_SCL              GPIO_NUM_9
+#define I2C_SDA                 GPIO_NUM_10
+#define I2C_SCL                 GPIO_NUM_9
 
-#define EXP_5V_GPIO          GPIO_NUM_41
-#define EXP_12V_GPIO         GPIO_NUM_42
-#define PWR_LATCH_GPIO       GPIO_NUM_2
-#define ESC_PWR_SENSE_GPIO   GPIO_NUM_1
+#define EXP_5V_GPIO             GPIO_NUM_41
+#define EXP_12V_GPIO            GPIO_NUM_42
+#define PWR_LATCH_GPIO          GPIO_NUM_2
+#define ESC_PWR_SENSE_GPIO      GPIO_NUM_1
 
-#define HEADLIGHT_OUT_GPIO   GPIO_NUM_15
-#define BRAKELIGHT_OUT_GPIO  GPIO_NUM_16
+#define HEADLIGHT_OUT_GPIO      GPIO_NUM_15
+#define HEADLIGHT_LEDC_CHANNEL  LEDC_CHANNEL_3
+#define BRAKELIGHT_OUT_GPIO     GPIO_NUM_16
+#define BRAKELIGHT_LEDC_CHANNEL LEDC_CHANNEL_4
 
 // Kinematics Macros
 //#define WHEEL_SIZE_MM        90
@@ -81,7 +84,8 @@ static const char *TAG = "skateinfo";
 #define ADC_BATT_CHANNEL     ADC_CHANNEL_4  // ADC1_4 is actually IO5. For battery voltage
 #define ADC_CURR_HS_CHANNEL  ADC_CHANNEL_3  // ADC1_3 is actually IO4. For battery current
 #define ADC_CURR_REF_CHANNEL ADC_CHANNEL_2  // ADC1_2 is actually IO3. For battery current reference
-
+#define ADC_12V_CURR_CHANNEL ADC_CHANNEL_5  // ADC1_5 is actually IO6. For 12V Power rail current
+#define ADC_5V_CURR_CHANNEL  ADC_CHANNEL_6  // ADC1_6 is actually IO7. For 5V Power rail current
 
 // Sampling / timings
 #define PWR_POLL_MS             100
@@ -127,6 +131,7 @@ static float speed_mph = 0.0f;
 static double trip_distance_miles;
 static float mAH_consumption = 0.0f;
 static int state_of_charge = 0;
+static uint32_t pack_voltage_mv;
 static uint32_t last_integration_time_ms = 0;
 static volatile bool esc_powered = false;
 static SemaphoreHandle_t pulse_mutex = NULL;
@@ -140,6 +145,88 @@ static i2c_master_bus_handle_t i2c_bus_handle = NULL;
 static TMP117* tmp117_sensor = NULL;
 static float device_temperature_c = 0.0f;
 
+// Accessory current globals (12V and 5V rails)
+static float accessory_current_12v_ma = 0.0f;
+static float accessory_current_5v_ma = 0.0f;
+static float accessory_watts = 0.0f;
+
+struct SkateInfoState {
+    uint32_t pack_voltage_mv = 0;
+    uint32_t pack_current_ma = 0;
+    uint8_t soc = 0;
+    int32_t pack_energy_mah = 0;
+    int8_t speed_mph = 0;
+    int8_t board_temperature_c = 0;
+};
+
+SkateInfoState skateInfoState;
+static MCP2515_CANController *canBus = NULL;
+
+// Accessory calibration constants (tweak as needed)
+static const float ACC_12V_VOLTAGE = 12.0f;
+static const float ACC_5V_VOLTAGE = 5.0f;
+static const float ACC_SHUNT_RATIO_12V = 220.0f; // default, adjust per hardware
+static const float ACC_SHUNT_RATIO_5V = 220.0f;  // default, adjust per hardware
+
+// Smoothed ADC raw averages provided by the ADC sampler task
+// Raw averaged ADC values stored as integer decimals (atomic uint32)
+static uint32_t adc_avg_12v_bits = 0;
+static uint32_t adc_avg_5v_bits = 0;
+static uint32_t adc_avg_batt_bits = 0;
+static uint32_t adc_avg_curr_hs_bits = 0;
+static uint32_t adc_avg_curr_ref_bits = 0;
+
+// ADC sampler task: alternately sample accessory channels 10x each tick
+static void adc_sampler_task(void *arg)
+{
+    (void)arg;
+    // 0=12V,1=5V,2=BattV,3=Ref,4=CurrHS
+    int idx = 0;
+
+    while (1) {
+        if (adc_handle == NULL) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        int channel = -1;
+        switch (idx) {
+            case 0: channel = ADC_12V_CURR_CHANNEL; break;
+            case 1: channel = ADC_5V_CURR_CHANNEL; break;
+            case 2: channel = ADC_BATT_CHANNEL; break;
+            case 3: channel = ADC_CURR_REF_CHANNEL; break;
+            case 4: channel = ADC_CURR_HS_CHANNEL; break;
+        }
+
+        if (channel >= 0) {
+            int tmp = 0;
+            ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, (adc_channel_t)channel, &tmp)); // dummy
+            esp_rom_delay_us(10);
+            int sum = 0;
+            for (int i = 0; i < 10; ++i) {
+                ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, (adc_channel_t)channel, &tmp));
+                sum += tmp;
+            }
+            uint32_t avg = (uint32_t)(sum / 10);
+            switch (idx) {
+                case 0: __atomic_store_n(&adc_avg_12v_bits, avg, __ATOMIC_RELAXED); break;
+                case 1: __atomic_store_n(&adc_avg_5v_bits, avg, __ATOMIC_RELAXED); break;
+                case 2: __atomic_store_n(&adc_avg_batt_bits, avg, __ATOMIC_RELAXED); break;
+                case 3: __atomic_store_n(&adc_avg_curr_ref_bits, avg, __ATOMIC_RELAXED); break;
+                case 4: __atomic_store_n(&adc_avg_curr_hs_bits, avg, __ATOMIC_RELAXED); break;
+            }
+        }
+
+        idx = (idx + 1) % 5;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// Battery configuration
+IntegratedBMS *bms = NULL;
+static const uint32_t pack_idle_current_ma = 200;
+
+INVSStorage *nvs = NULL;
 
 /* BLE RX message queue structure and handle */
 typedef struct {
@@ -149,6 +236,30 @@ typedef struct {
 
 static QueueHandle_t ble_rx_queue = NULL;
 static const uint16_t BLE_RX_QUEUE_SIZE = 10;
+
+static uint32_t readPackVoltageMillivolts(bool useBulkReader){
+    const float voltDividerRatio = 25.325f;
+    // Prefer sampler-provided averaged raw value if available
+    
+    if(useBulkReader){
+        uint32_t bits = __atomic_load_n(&adc_avg_batt_bits, __ATOMIC_RELAXED);
+        if (bits != 0) {
+            float raw_avg = (float)bits;
+            float battVoltageCorr = raw_avg * voltDividerRatio;
+            return (uint32_t)battVoltageCorr;
+        }
+        return 0;
+    }
+    else{
+        // Fallback: direct ADC read
+        int raw_batt = 0;
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_BATT_CHANNEL, &raw_batt));
+        esp_rom_delay_us(10);
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_BATT_CHANNEL, &raw_batt));
+        float battVoltageCorr = ((float)raw_batt * voltDividerRatio);
+        return (uint32_t)battVoltageCorr;
+    }
+}
 
 // ISR for hall pulse
 static void IRAM_ATTR hall_isr_handler(void *arg)
@@ -238,50 +349,31 @@ static void sensor_task(void *arg)
 {
     (void)arg;
 
-    // ADC init (oneshot API for esp-idf v5+)
-    if (adc_handle == NULL) {
-        adc_oneshot_unit_init_cfg_t init_cfg = {
-            .unit_id = ADC_UNIT_1,
-            .ulp_mode = ADC_ULP_MODE_DISABLE,
-        };
-        ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &adc_handle));
-
-        adc_oneshot_chan_cfg_t chan_cfg = {
-            .atten = ADC_ATTEN_DB_11,
-            .bitwidth = ADC_BITWIDTH_DEFAULT,
-        };
-        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_BATT_CHANNEL, &chan_cfg));
-        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CURR_HS_CHANNEL, &chan_cfg));
-        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CURR_REF_CHANNEL, &chan_cfg));
-    }
-
     last_integration_time_ms = esp_log_timestamp();
 
     while (1) {
-        uint32_t now = esp_log_timestamp();
+        //uint32_t now = esp_log_timestamp();
 
-        int raw_batt = 0;
-        int raw_curr = 0;
-        int ref = 0;
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CURR_REF_CHANNEL, &ref));  //Read this first to activate the channel to prevent ghost reading
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_BATT_CHANNEL, &raw_batt));
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CURR_HS_CHANNEL, &raw_curr));
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CURR_REF_CHANNEL, &ref));
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CURR_HS_CHANNEL, &raw_curr));
-        const float voltDividerRatio = 39.5f;
+        // Use averaged raw ADC values for current/reference provided by adc_sampler_task
+        float raw_curr = 0.0f;
+        float ref = 0.0f;
+        uint32_t hs_adc = __atomic_load_n(&adc_avg_curr_hs_bits, __ATOMIC_RELAXED);
+        uint32_t ref_adc = __atomic_load_n(&adc_avg_curr_ref_bits, __ATOMIC_RELAXED);
+        raw_curr = (float)hs_adc;
+        ref = (float)ref_adc;
+        
+        // Use averaged raw ADC values produced by adc_sampler_task
+        float raw_12v_avg; 
+        float raw_5v_avg;
+        uint32_t acc_12vs_adc = __atomic_load_n(&adc_avg_12v_bits, __ATOMIC_RELAXED);
+        uint32_t acc_5vs_adc = __atomic_load_n(&adc_avg_5v_bits, __ATOMIC_RELAXED);
+        raw_12v_avg = (float)acc_12vs_adc;
+        raw_5v_avg = (float)acc_5vs_adc;
+        
         const float shuntRatio = 42.0f;
-        const float adc_cal = 35.0f;
+        const float adc_cal = 5.0f;
 
-        // Translate raw ADC (0-4095) to approximate values used in original sketch
-        // Note: you should calibrate these formulas for your voltage divider and sense resistor
-        float battVoltageRaw = (float)raw_batt; // similar to analogRead(A1)
-        float battVoltageCorr = (battVoltageRaw * 1000.0f / voltDividerRatio); // update formula as needed
-
-        // SOC estimate
-        const float cell_voltage_range = BATT_CELL_MAX - BATT_CELL_MIN;
-        state_of_charge = (100 * ((battVoltageCorr * 0.001 / BATT_CELL_COUNT) - BATT_CELL_MIN)) / cell_voltage_range;
-        if(state_of_charge > 100) state_of_charge = 100;
-        else if(state_of_charge < 0) state_of_charge = 0;
+        float batteryVoltage = (float)readPackVoltageMillivolts(true);
 
         // Battery current calculation for bidirectional amp
         // We'll average the ADC reference reading (`ref`) and the last 10
@@ -314,17 +406,57 @@ static void sensor_task(void *arg)
         curr_buf[curr_idx] = battCurrentmA_instant;
         curr_idx = (curr_idx + 1) % CURR_BUF_SIZE;
         if (curr_count < CURR_BUF_SIZE) curr_count++;
+        
+        // --- Accessory current averaging (10-sample moving average each)
+        enum { ACC_CURR_BUF_SIZE = 10 };
+        static float acc12_buf[ACC_CURR_BUF_SIZE] = {0};
+        static int acc12_idx = 0;
+        static int acc12_count = 0;
+        static float acc5_buf[ACC_CURR_BUF_SIZE] = {0};
+        static int acc5_idx = 0;
+        static int acc5_count = 0;
+
+        // Convert averaged raw ADC to mA for accessories (use sampler's 10-sample average)
+        float acc12_mA_instant = (raw_12v_avg * 1000.0f / ACC_SHUNT_RATIO_12V);
+        float acc5_mA_instant = (raw_5v_avg * 1000.0f / ACC_SHUNT_RATIO_5V);
+
+        acc12_buf[acc12_idx] = acc12_mA_instant;
+        acc12_idx = (acc12_idx + 1) % ACC_CURR_BUF_SIZE;
+        if (acc12_count < ACC_CURR_BUF_SIZE) acc12_count++;
+
+        acc5_buf[acc5_idx] = acc5_mA_instant;
+        acc5_idx = (acc5_idx + 1) % ACC_CURR_BUF_SIZE;
+        if (acc5_count < ACC_CURR_BUF_SIZE) acc5_count++;
+
+        accessory_current_12v_ma = 0.0f;
+        for (int i = 0; i < acc12_count; ++i) accessory_current_12v_ma += acc12_buf[i];
+        if (acc12_count > 0) accessory_current_12v_ma /= (float)acc12_count;
+
+        accessory_current_5v_ma = 0.0f;
+        for (int i = 0; i < acc5_count; ++i) accessory_current_5v_ma += acc5_buf[i];
+        if (acc5_count > 0) accessory_current_5v_ma /= (float)acc5_count;
+
+        // Compute accessory power (watts) = sum( I(A) * V )
+        accessory_watts = (accessory_current_12v_ma / 1000.0f) * ACC_12V_VOLTAGE + (accessory_current_5v_ma / 1000.0f) * ACC_5V_VOLTAGE;
 
         float battCurrentmA = 0.0f;
         for (int i = 0; i < curr_count; ++i) battCurrentmA += curr_buf[i];
         if (curr_count > 0) battCurrentmA /= (float)curr_count;
 
-        // integrate mAh
-        uint32_t dt_ms = now - last_integration_time_ms;
-        if (dt_ms > 0) {
-            mAH_consumption += battCurrentmA * ((float)dt_ms / 3600000.0f);
-            last_integration_time_ms = now;
+        if(bms != NULL){
+            bms->update(-(int32_t)battCurrentmA, batteryVoltage, 25.0f);
+            mAH_consumption = (float)bms->getEnergyConsumed();
+            state_of_charge = (int)bms->getSoC();
         }
+
+        if (tmp117_sensor != NULL) {
+            esp_err_t ret = tmp117_sensor->readTemperature(&device_temperature_c);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to read TMP117 temperature: %s", esp_err_to_name(ret));
+            }
+        }
+
+        ESP_LOGI(TAG, "5V_raw=%.1f 5V_A=%.1f 12V_raw=%.1f 12V_A=%.1f", raw_5v_avg, accessory_current_5v_ma, raw_12v_avg, accessory_current_12v_ma);
 
         //ESP_LOGI(TAG, "battRaw=%d battCorr=%.0f mA=%.1f mAH=%.3f", raw_batt, battVoltageCorr, battCurrentmA, mAH_consumption);
 
@@ -332,6 +464,63 @@ static void sensor_task(void *arg)
         /* (These are static globals used by ble_telemetry_task) */
 
         vTaskDelay(pdMS_TO_TICKS(RPM_POLL_MS));
+    }
+}
+
+static void write_u32_le(uint8_t *destination, uint32_t value)
+{
+    destination[0] = static_cast<uint8_t>(value);
+    destination[1] = static_cast<uint8_t>(value >> 8);
+    destination[2] = static_cast<uint8_t>(value >> 16);
+    destination[3] = static_cast<uint8_t>(value >> 24);
+}
+
+static int8_t to_can_int8(float value)
+{
+    if (value > 127.0f) return 127;
+    if (value < -128.0f) return -128;
+    return static_cast<int8_t>(value);
+}
+
+static void canbus_task(void *arg)
+{
+    (void)arg;
+
+    while (canBus == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    while (1) {
+        if (bms != NULL) {
+            skateInfoState.pack_voltage_mv = bms->getPackVoltageMillivolts();
+            skateInfoState.pack_current_ma = bms->getPackCurrentMilliamps();
+            skateInfoState.soc = static_cast<uint8_t>(bms->getSoC());
+            skateInfoState.pack_energy_mah = bms->getEnergyConsumed();
+        }
+
+        skateInfoState.speed_mph = to_can_int8(speed_mph);
+        skateInfoState.board_temperature_c = to_can_int8(device_temperature_c);
+
+        CANMessage power_message;
+        power_message.addr = 0x200;
+        write_u32_le(&power_message.bytes[0], skateInfoState.pack_voltage_mv);
+        write_u32_le(&power_message.bytes[4], skateInfoState.pack_current_ma);
+
+        CANMessage status_message;
+        status_message.addr = 0x201;
+        status_message.bytes[0] = skateInfoState.soc;
+        write_u32_le(&status_message.bytes[1],
+                     static_cast<uint32_t>(skateInfoState.pack_energy_mah));
+        status_message.bytes[5] = static_cast<uint8_t>(skateInfoState.speed_mph);
+        status_message.bytes[6] = static_cast<uint8_t>(skateInfoState.board_temperature_c);
+        status_message.bytes[7] = 0;
+
+        if (canBus->send(power_message) != ICANController::CANResult::Success ||
+            canBus->send(status_message) != ICANController::CANResult::Success) {
+            ESP_LOGW(TAG, "Failed to transmit CAN telemetry");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -368,6 +557,30 @@ static void taillightHandler(uint8_t brightness)
     ESP_LOGI(TAG, "Taillight command received: brightness=%d", brightness);
     // TODO: Update global taillight state variable
     // Example: taillight_brightness = brightness;
+}
+
+static void handleResetHistoricalCapacity()
+{
+    if (bms == nullptr) {
+        ESP_LOGW(TAG, "BMS pointer is null, cannot reset historical capacity");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Resetting BMS historical capacity");
+    bms->resetHistoricalCapacity();
+}
+
+static void handleResetEnergyConsumption()
+{
+    if (bms == nullptr) {
+        ESP_LOGW(TAG, "BMS pointer is null, cannot reset energy consumption");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Resetting BMS energy consumption using OCV, packV=%lu mV",
+             pack_voltage_mv);
+
+    bms->resetEnergyConsumptionFromOpenCircuitVoltage(pack_voltage_mv);
 }
 
 
@@ -427,6 +640,23 @@ static void ble_process_command_queue(void)
         if (mode_item != NULL && cJSON_IsString(mode_item)) {
             modeHandler(mode_item->valuestring);
         }
+
+        /* Handle BMS reset historical capacity (bms_rhc) */
+        cJSON *rhc_item = cJSON_GetObjectItem(root, "bms_rhc");
+        if (rhc_item != NULL && cJSON_IsBool(rhc_item)) {
+            if (cJSON_IsTrue(rhc_item)) {
+                handleResetHistoricalCapacity();
+            }
+        }
+
+        /* Handle BMS reset energy consumption (bms_rec) */
+        cJSON *rec_item = cJSON_GetObjectItem(root, "bms_rec");
+        if (rec_item != NULL && cJSON_IsBool(rec_item)) {
+            if (cJSON_IsTrue(rec_item)) {
+                handleResetEnergyConsumption();
+            }
+        }
+
 
         /* Clean up cJSON object */
         cJSON_Delete(root);
@@ -539,13 +769,39 @@ static void ble_telemetry_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for BLE to initialize
 
     while (1) {
-        /* Create JSON telemetry object with current sensor data */
-        char json[256];
-        int n = snprintf(json, sizeof(json), "{\"mAH\":%d,\"soc\":%d,\"trip\":%0.2f,\"mph\":%.1f,\"reva\":%" PRIu32 ",\"rev_l\":%" PRIu32 ",\"rev_r\":%" PRIu32 ",\"temp\":%.2f}",
-                 (int)mAH_consumption, state_of_charge, trip_distance_miles, speed_mph, avg_rpm, rpm_left, rpm_right, device_temperature_c);
+        cJSON *telemetry = cJSON_CreateObject();
+        if (telemetry == NULL) {
+            ESP_LOGE(TAG, "Failed to create JSON object");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* Add telemetry fields */
+        char buf_temp[32];
+        snprintf(buf_temp, sizeof(buf_temp), "%.1f", device_temperature_c);
+        cJSON_AddStringToObject(telemetry, "tb", buf_temp);
+
+        if(bms != NULL){
+            cJSON_AddNumberToObject(telemetry, "bV", bms->getPackVoltageMillivolts());
+            cJSON_AddNumberToObject(telemetry, "bI", bms->getPackCurrentMilliamps());
+            cJSON_AddNumberToObject(telemetry, "sc", (uint32_t)bms->getSoC());
+            cJSON_AddNumberToObject(telemetry, "ec", bms->getEnergyConsumed());
+        }
+
+        /* Serialize to string */
+        char *json_str = cJSON_PrintUnformatted(telemetry);
+        if (json_str == NULL) {
+            ESP_LOGE(TAG, "Failed to serialize JSON");
+            cJSON_Delete(telemetry);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
 
         /* Send telemetry via UART service */
-        uart_service.sendTelemetry(json);
+        uart_service.sendTelemetry(json_str);
+
+        cJSON_free(json_str);
+        cJSON_Delete(telemetry);
 
         /* Broadcast every 500ms */
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -590,16 +846,6 @@ static spi_device_handle_t spi_mcp2515_init(void)
         return NULL;
     }
     ESP_LOGI(TAG, "MCP2515 SPI device added to bus with CS on GPIO %d", SPI_CS_PIN);
-
-    // Configure CS pin as output (SPI driver should handle it, but ensure it's set up)
-    gpio_config_t dig_conf = {};
-    dig_conf.pin_bit_mask = (1ULL << SPI_CS_PIN);
-    dig_conf.mode = GPIO_MODE_OUTPUT;
-    dig_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-    dig_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    dig_conf.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&dig_conf);
-    gpio_set_level(SPI_CS_PIN, 0);  // CS high initially (inactive)
 
     return handle;
 }
@@ -691,6 +937,27 @@ static void configureHallGPIO(gpio_num_t gpio){
 
 }
 
+static void adc_init(void){
+    // ADC init (oneshot API for esp-idf v5+)
+    if (adc_handle == NULL) {
+        adc_oneshot_unit_init_cfg_t init_cfg = {
+            .unit_id = ADC_UNIT_1,
+            .ulp_mode = ADC_ULP_MODE_DISABLE,
+        };
+        ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &adc_handle));
+
+        adc_oneshot_chan_cfg_t chan_cfg = {
+            .atten = ADC_ATTEN_DB_11,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_BATT_CHANNEL, &chan_cfg));
+        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CURR_HS_CHANNEL, &chan_cfg));
+        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CURR_REF_CHANNEL, &chan_cfg));
+        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_12V_CURR_CHANNEL, &chan_cfg));
+        ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_5V_CURR_CHANNEL, &chan_cfg));
+    }
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Starting SkateInfoView ESP32-S3");
@@ -699,6 +966,36 @@ extern "C" void app_main(void)
     /* Create resources */
     pulse_mutex = xSemaphoreCreateMutex();
     ble_rx_queue = xQueueCreate(BLE_RX_QUEUE_SIZE, sizeof(ble_rx_message_t));
+
+    gpio_config_t io_conf_exp_latch = {
+        .pin_bit_mask = (1ULL << PWR_LATCH_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf_exp_latch);
+    gpio_set_level(PWR_LATCH_GPIO, 1);
+
+    gpio_config_t io_conf_exp_5V = {
+        .pin_bit_mask = (1ULL << EXP_5V_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf_exp_5V);
+    gpio_set_level(EXP_5V_GPIO, 1);
+
+    gpio_config_t io_conf_exp_12V = {
+        .pin_bit_mask = (1ULL << EXP_12V_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf_exp_12V);
+    gpio_set_level(EXP_12V_GPIO, 1);
 
     // Initialize UART for ISO communications (uses `UART_ISO_TX`/`UART_ISO_RX`)
     uart_iso_init();
@@ -738,76 +1035,24 @@ extern "C" void app_main(void)
     }
 
     configureHallGPIO(HALL_LEFT_A_GPIO);
-    //configureHallGPIO(HALL_LEFT_B_GPIO);
-    //configureHallGPIO(HALL_LEFT_C_GPIO);
+    configureHallGPIO(HALL_LEFT_B_GPIO);
+    configureHallGPIO(HALL_LEFT_C_GPIO);
     configureHallGPIO(HALL_RIGHT_A_GPIO);
-    //configureHallGPIO(HALL_RIGHT_B_GPIO);
-    //configureHallGPIO(HALL_RIGHT_C_GPIO);
+    configureHallGPIO(HALL_RIGHT_B_GPIO);
+    configureHallGPIO(HALL_RIGHT_C_GPIO);
 
     configurePowerSenseGPIO(ESC_PWR_SENSE_GPIO);
 
-    /* Start sensor and rpm tasks */
-    xTaskCreate(rpm_task, "rpm_task", 4096, NULL, 5, NULL);
-    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
-    xTaskCreate(power_control_task, "power_control_Task", 4096, NULL, 6, NULL);
+    adc_init();
    
-    ESP32LED::configurePWMPin(HEADLIGHT_OUT_GPIO, LEDC_CHANNEL_3);
-    ESP32LED::configurePWMPin(BRAKELIGHT_OUT_GPIO, LEDC_CHANNEL_4);
+    ESP32LED::configurePWMPin(HEADLIGHT_OUT_GPIO, HEADLIGHT_LEDC_CHANNEL);
+    ESP32LED::configurePWMPin(BRAKELIGHT_OUT_GPIO, BRAKELIGHT_LEDC_CHANNEL);
 
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3, 0));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_3));
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, HEADLIGHT_LEDC_CHANNEL, 64));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, HEADLIGHT_LEDC_CHANNEL));
 
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_4, 0));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_4));
-
-#if CONFIG_BT_NIMBLE_ENABLED
-    /* Initialize BLE and start telemetry task */
-    ble_init();
-    xTaskCreate(ble_telemetry_task, "ble_telemetry_task", 4096, NULL, 5, NULL);
-#endif
-
-    
-
-    gpio_config_t io_conf_exp_5V = {
-        .pin_bit_mask = (1ULL << EXP_5V_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf_exp_5V);
-    gpio_set_level(EXP_5V_GPIO, 1);
-
-    gpio_config_t io_conf_exp_12V = {
-        .pin_bit_mask = (1ULL << EXP_12V_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf_exp_12V);
-    gpio_set_level(EXP_12V_GPIO, 1);
-
-    gpio_config_t io_conf_exp_latch = {
-        .pin_bit_mask = (1ULL << PWR_LATCH_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf_exp_latch);
-    gpio_set_level(PWR_LATCH_GPIO, 1);
-
-    //TCS34725 tcs(GPIO_NUM_9, GPIO_NUM_10);
-    //tcs.init();
-
-    /*for(;;){
-        RGBWColor c;
-        tcs.getRawColor(&c);
-    
-        ESP_LOGI("Color", "Color: %d %d %d", c.red, c.green, c.blue);
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }*/
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BRAKELIGHT_LEDC_CHANNEL, 0));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BRAKELIGHT_LEDC_CHANNEL));
 
     // --- MCP2515 CAN Controller Initialization
     // SPI pins: MOSI=13, MISO=12, SCK=14, CS=11
@@ -818,22 +1063,60 @@ extern "C" void app_main(void)
         return;
     }
 
-    // Create MCP_CAN instance with the SPI device handle
-    MCP_CAN *canBus = new MCP_CAN(spi_handle);
+    // Create the shared MCP2515 controller with the SPI device handle
+    canBus = new MCP2515_CANController(spi_handle, MCP_8MHZ, MCP_ANY);
     
     // Initialize CAN bus: 500 kbps, 8 MHz oscillator, standard/extended ID mode
-    INT8U status = canBus->begin(MCP_ANY, CAN_500KBPS, MCP_8MHZ);
-    if (status != CAN_OK) {
+    bool status = canBus->begin(500000);
+    if (!status) {
         ESP_LOGE(TAG, "Failed to initialize MCP2515 CAN controller, status: %d", status);
+        canBus = NULL;
     } else {
         ESP_LOGI(TAG, "MCP2515 CAN controller initialized successfully at 500 kbps");
     }
-    canBus->setMode(MCP_NORMAL);
 
-    /*for(;;){
-        uint8_t data[8] = {0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8};
-        uint8_t re = canBus->sendMsgBuf(0x100, 8, data);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        ESP_LOGI("CANBUS", "TX CAN %d", (int)re);
-    }*/
+    nvs = new NVSStorage("bms");
+    nvs->init();
+
+    BatteryConfiguration default_battery_config{
+        .crc32 = 0,
+        .battery_curve_mv = { 3100, 3300, 3425, 3550, 3625, 3700, 3775, 3850, 3925, 4000, 4100 },
+        .battery_designed_capacity_mAh = 8500,
+        .battery_cells_parallel = 3,
+        .battery_cells_series = 12,
+        .temperature_curve_temperatures_c = {-25, -10, 0, 10, 20, 30, 40, 50, 60, 70},
+        .discharge_limits_ma = { 10000, 15000, 30000, 60000, 60000, 60000, 60000, 60000, 40000, 10000 },
+        .charge_limits_ma = { 2000, 3000, 10000, 15000, 15000, 15000, 15000, 10000, 3000, 1000 }
+    };
+
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // NOTE: This needs to have some delay after the power latch is set or we don't get battery voltage.
+    // Might only be a problem when powered by USB.
+    pack_voltage_mv = readPackVoltageMillivolts(false);    
+    
+    ESP_LOGI(TAG, "Read initial pack voltage to be %lu", pack_voltage_mv);
+
+    bms = new IntegratedBMS(nvs);
+    bms->init(default_battery_config, pack_voltage_mv, pack_idle_current_ma);
+
+    ESP_LOGI(TAG, "BMS initial values %lu", bms->getEnergyRemaining());
+
+    
+
+    /* Start sensor and rpm tasks */
+    xTaskCreate(rpm_task, "rpm_task", 4096, NULL, 5, NULL);
+    // ADC sampler runs faster and provides averaged raw ADC values for accessories
+    xTaskCreate(adc_sampler_task, "adc_sampler", 2048, NULL, 6, NULL);
+    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+    if (canBus != NULL) {
+        xTaskCreate(canbus_task, "canbus_task", 4096, NULL, 5, NULL);
+    }
+    xTaskCreate(power_control_task, "power_control_Task", 4096, NULL, 6, NULL);
+
+#if CONFIG_BT_NIMBLE_ENABLED
+    /* Initialize BLE and start telemetry task */
+    ble_init();
+    xTaskCreate(ble_telemetry_task, "ble_telemetry_task", 4096, NULL, 5, NULL);
+#endif
 }
