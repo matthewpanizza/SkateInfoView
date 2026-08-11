@@ -716,9 +716,14 @@ static void power_control_task(void *arg){
 #if CONFIG_BT_NIMBLE_ENABLED
 
 /* Process BLE command JSON and update device parameters */
-static void ble_process_command(const char *json_str)
+static void ble_process_command(const uint8_t *data, uint16_t length)
 {
-    ESP_LOGI(TAG, "Processing BLE command: %s", json_str);
+    if (data == nullptr || length == 0) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Processing BLE command: %.*s", static_cast<int>(length),
+             reinterpret_cast<const char *>(data));
 
     if (ble_rx_queue == NULL) {
         ESP_LOGW(TAG, "BLE RX queue not initialized");
@@ -726,9 +731,8 @@ static void ble_process_command(const char *json_str)
     }
 
     ble_rx_message_t msg;
-    size_t len = strlen(json_str);
-    msg.len = len > sizeof(msg.data) ? sizeof(msg.data) : len;
-    memcpy(msg.data, json_str, msg.len);
+    msg.len = length >= sizeof(msg.data) ? sizeof(msg.data) - 1 : length;
+    memcpy(msg.data, data, msg.len);
 
     /* Send to queue with timeout; drop message if queue is full */
     BaseType_t res = xQueueSend(ble_rx_queue, &msg, pdMS_TO_TICKS(100));
