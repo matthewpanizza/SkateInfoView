@@ -34,6 +34,7 @@
 
 #include "RGB_LED.h"
 #include "TCS34725.h"
+#include "BoardConfiguration.h"
 #include "MCP2515_CANController.h"
 #include "TMP117.h"
 #include "driver/i2c_master.h"
@@ -102,10 +103,20 @@ static const char *TAG = "skateinfo";
 BLEStack ble("SK01");
 
 /* UART/Telemetry Service instance - initialized during BLE setup */
-static BLEUARTService uart_service;
+static BLEUARTService uart_service(
+    "12342001-B5A3-F393-E0A9-E50E24DCCA9E",
+    "12342002-B5A3-F393-E0A9-E50E24DCCA9E",
+    "12342003-B5A3-F393-E0A9-E50E24DCCA9E");
 
 /* OTA Service instance - initialized during BLE setup */
 static BLEOTAService ota_service;
+
+/* Separate UART service used by the CAN analyzer console. */
+static BLEUARTService can_console_uart_service;
+static BLESerialConsole can_console(can_console_uart_service);
+static CANAnalyzerStack* can_analyzer = NULL;
+static CANMessage can_analyzer_rx_buffer[64] = {};
+static uint16_t can_analyzer_rx_index = 0;
 #endif
 
 // Shared state
@@ -161,6 +172,11 @@ struct SkateInfoState {
 
 SkateInfoState skateInfoState;
 static MCP2515_CANController *canBus = NULL;
+
+static uint64_t can_analyzer_millis()
+{
+    return static_cast<uint64_t>(esp_log_timestamp());
+}
 
 // Accessory calibration constants (tweak as needed)
 static const float ACC_12V_VOLTAGE = 12.0f;
@@ -227,6 +243,23 @@ IntegratedBMS *bms = NULL;
 static const uint32_t pack_idle_current_ma = 200;
 
 INVSStorage *nvs = NULL;
+BoardConfiguration boardConfiguration{};
+
+static void board_configuration_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(60000));
+
+        if (nvs != NULL) {
+            esp_err_t err = board_configuration_save(*nvs, boardConfiguration);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to save board configuration: %s", esp_err_to_name(err));
+            }
+        }
+    }
+}
 
 /* BLE RX message queue structure and handle */
 typedef struct {
@@ -491,6 +524,17 @@ static void canbus_task(void *arg)
     }
 
     while (1) {
+        if (can_analyzer != NULL) {
+            std::vector<std::string> console_lines;
+            if (can_console.processLines(console_lines)) {
+                for (const std::string& line : console_lines) {
+                    can_analyzer->processLine(line);
+                }
+            }
+            can_analyzer->receiveCANFrames();
+            can_analyzer->processCANFrames();
+        }
+
         if (bms != NULL) {
             skateInfoState.pack_voltage_mv = bms->getPackVoltageMillivolts();
             skateInfoState.pack_current_ma = bms->getPackCurrentMilliamps();
@@ -762,7 +806,17 @@ static void ble_init(void)
         }
     });
 
-    ble.init({ &uart_service, &ota_service });
+    ble.init({ &uart_service, &ota_service, &can_console_uart_service });
+
+    if (canBus != NULL) {
+        can_analyzer = new CANAnalyzerStack(
+            can_console,
+            *canBus,
+            can_analyzer_rx_buffer,
+            static_cast<uint16_t>(sizeof(can_analyzer_rx_buffer) / sizeof(can_analyzer_rx_buffer[0])),
+            &can_analyzer_rx_index,
+            can_analyzer_millis);
+    }
     
 }
 
@@ -1080,7 +1134,12 @@ extern "C" void app_main(void)
     }
 
     nvs = new NVSStorage("bms");
-    nvs->init();
+    ESP_ERROR_CHECK(nvs->init());
+
+    esp_err_t board_configuration_err = board_configuration_load(*nvs, boardConfiguration);
+    if (board_configuration_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to load board configuration: %s", esp_err_to_name(board_configuration_err));
+    }
 
     BatteryConfiguration default_battery_config{
         .crc32 = 0,
@@ -1106,7 +1165,7 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG, "BMS initial values %lu", bms->getEnergyRemaining());
 
-    
+    xTaskCreate(board_configuration_task, "board_config", 2048, NULL, 4, NULL);
 
     /* Start sensor and rpm tasks */
     xTaskCreate(rpm_task, "rpm_task", 4096, NULL, 5, NULL);
