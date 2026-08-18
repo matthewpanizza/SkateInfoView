@@ -114,9 +114,31 @@ static BLEOTAService ota_service;
 /* Separate UART service used by the CAN analyzer console. */
 static BLEUARTService can_console_uart_service;
 static BLESerialConsole can_console(can_console_uart_service);
-static CANAnalyzerStack* can_analyzer = NULL;
-static CANMessage can_analyzer_rx_buffer[64] = {};
-static uint16_t can_analyzer_rx_index = 0;
+static constexpr uint16_t CANALYZER_RX_BUFFER_SIZE = 64;
+static CANMessage canalyzer_rx_buffer[CANALYZER_RX_BUFFER_SIZE];
+static uint16_t canalyzer_rx_buffer_index = 0;
+static CANAnalyzerStack *canalyzer = nullptr;
+
+static uint64_t canalyzer_get_millis()
+{
+    return static_cast<uint64_t>(esp_timer_get_time() / 1000);
+}
+
+static MenuItem root_menu("root");
+static void diagnostics_menu_on_enter()
+{
+    can_console.writeLine("Entered diagnostics menu");
+}
+
+static void canalyzer_menu_on_enter()
+{
+    if (canalyzer != nullptr) {
+        canalyzer->printHelp();
+    }
+}
+
+static MenuItem diagnostics_menu("diagnostics", diagnostics_menu_on_enter);
+static MenuSystem menu_system(&root_menu);
 #endif
 
 // Shared state
@@ -172,11 +194,6 @@ struct SkateInfoState {
 
 SkateInfoState skateInfoState;
 static MCP2515_CANController *canBus = NULL;
-
-static uint64_t can_analyzer_millis()
-{
-    return static_cast<uint64_t>(esp_log_timestamp());
-}
 
 // Accessory calibration constants (tweak as needed)
 static const float ACC_12V_VOLTAGE = 12.0f;
@@ -524,17 +541,6 @@ static void canbus_task(void *arg)
     }
 
     while (1) {
-        if (can_analyzer != NULL) {
-            std::vector<std::string> console_lines;
-            if (can_console.processLines(console_lines)) {
-                for (const std::string& line : console_lines) {
-                    can_analyzer->processLine(line);
-                }
-            }
-            can_analyzer->receiveCANFrames();
-            can_analyzer->processCANFrames();
-        }
-
         if (bms != NULL) {
             skateInfoState.pack_voltage_mv = bms->getPackVoltageMillivolts();
             skateInfoState.pack_current_ma = bms->getPackCurrentMilliamps();
@@ -567,6 +573,53 @@ static void canbus_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
+
+#if CONFIG_BT_NIMBLE_ENABLED
+
+static void initialize_menu_system()
+{
+    root_menu.addCommand("help", nullptr, [](std::string*) {
+        can_console.writeLine("Commands: help, status, diagnostics");
+    });
+    root_menu.addCommand("status", nullptr, [](std::string* command) {
+        can_console.writeLine(std::string("Status action received: ") + *command);
+    });
+    root_menu.addCommand("diagnostics", &diagnostics_menu, nullptr);
+
+    diagnostics_menu.addCommand("hello", nullptr, [](std::string*) {
+        can_console.writeLine("Hello from the nested diagnostics menu");
+    });
+    diagnostics_menu.addCommand("echo", nullptr, [](std::string* command) {
+        can_console.writeLine(std::string("Echo: ") + *command);
+    });
+    diagnostics_menu.addCommand("help", nullptr, [](std::string*) {
+        can_console.writeLine("Diagnostics commands: hello, echo, back, root");
+    });
+    if (canalyzer != nullptr) {
+        canalyzer->canalyzerMenu()->setOnEnter(canalyzer_menu_on_enter);
+        diagnostics_menu.addCommand("canalyzer", canalyzer->canalyzerMenu(), nullptr);
+    }
+}
+
+static void menu_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        std::vector<std::string> console_lines;
+        if (can_console.processLines(console_lines)) {
+            for (const std::string& line : console_lines) {
+                if (!menu_system.processCommand(line)) {
+                    can_console.writeLine(std::string("Unknown menu command: ") + line);
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+#endif /* CONFIG_BT_NIMBLE_ENABLED */
 
 /* Handler functions for BLE control commands */
 
@@ -807,16 +860,6 @@ static void ble_init(void)
     });
 
     ble.init({ &uart_service, &ota_service, &can_console_uart_service });
-
-    if (canBus != NULL) {
-        can_analyzer = new CANAnalyzerStack(
-            can_console,
-            *canBus,
-            can_analyzer_rx_buffer,
-            static_cast<uint16_t>(sizeof(can_analyzer_rx_buffer) / sizeof(can_analyzer_rx_buffer[0])),
-            &can_analyzer_rx_index,
-            can_analyzer_millis);
-    }
     
 }
 
@@ -1133,6 +1176,18 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "MCP2515 CAN controller initialized successfully at 500 kbps");
     }
 
+#if CONFIG_BT_NIMBLE_ENABLED
+    if (canBus != NULL) {
+        canalyzer = new CANAnalyzerStack(
+            can_console,
+            *canBus,
+            canalyzer_rx_buffer,
+            CANALYZER_RX_BUFFER_SIZE,
+            &canalyzer_rx_buffer_index,
+            canalyzer_get_millis);
+    }
+#endif
+
     nvs = new NVSStorage("bms");
     ESP_ERROR_CHECK(nvs->init());
 
@@ -1179,7 +1234,9 @@ extern "C" void app_main(void)
 
 #if CONFIG_BT_NIMBLE_ENABLED
     /* Initialize BLE and start telemetry task */
+    initialize_menu_system();
     ble_init();
+    xTaskCreate(menu_task, "ble_menu_task", 4096, NULL, 5, NULL);
     xTaskCreate(ble_telemetry_task, "ble_telemetry_task", 4096, NULL, 5, NULL);
 #endif
 }
