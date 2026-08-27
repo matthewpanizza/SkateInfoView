@@ -106,18 +106,29 @@ BLEStack ble("SK01");
 static BLEUARTService uart_service(
     "12342001-B5A3-F393-E0A9-E50E24DCCA9E",
     "12342002-B5A3-F393-E0A9-E50E24DCCA9E",
-    "12342003-B5A3-F393-E0A9-E50E24DCCA9E");
+    "12342003-B5A3-F393-E0A9-E50E24DCCA9E",
+    16);
 
 /* OTA Service instance - initialized during BLE setup */
 static BLEOTAService ota_service;
 
 /* Separate UART service used by the CAN analyzer console. */
-static BLEUARTService can_console_uart_service;
+static BLEUARTService can_console_uart_service(64);
 static BLESerialConsole can_console(can_console_uart_service);
 static constexpr uint16_t CANALYZER_RX_BUFFER_SIZE = 64;
 static CANMessage canalyzer_rx_buffer[CANALYZER_RX_BUFFER_SIZE];
 static uint16_t canalyzer_rx_buffer_index = 0;
+static constexpr uint16_t CANALYZER_TX_BUFFER_SIZE = 20;
+static CANMessage canalyzer_tx_buffer[CANALYZER_TX_BUFFER_SIZE];
+static uint16_t canalyzer_tx_buffer_index = 0;
 static CANAnalyzerStack *canalyzer = nullptr;
+
+static void canalyzer_tx_callback(const CANMessage &message, void *)
+{
+    canalyzer_tx_buffer[canalyzer_tx_buffer_index] = message;
+    canalyzer_tx_buffer_index = static_cast<uint16_t>(
+        (canalyzer_tx_buffer_index + 1) % CANALYZER_TX_BUFFER_SIZE);
+}
 
 static uint64_t canalyzer_get_millis()
 {
@@ -615,6 +626,11 @@ static void menu_task(void *arg)
             }
         }
 
+        if (canalyzer != nullptr) {
+            canalyzer->receiveCANFrames();
+            canalyzer->processCANFrames();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -868,44 +884,46 @@ static void ble_telemetry_task(void *arg)
 {
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for BLE to initialize
+    TickType_t last_telemetry_tick = xTaskGetTickCount();
 
     while (1) {
-        cJSON *telemetry = cJSON_CreateObject();
-        if (telemetry == NULL) {
-            ESP_LOGE(TAG, "Failed to create JSON object");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
+        uart_service.send_queue_messages();
+        can_console_uart_service.send_queue_messages();
+
+        const TickType_t now = xTaskGetTickCount();
+        if ((now - last_telemetry_tick) >= pdMS_TO_TICKS(500)) {
+            last_telemetry_tick = now;
+            cJSON *telemetry = cJSON_CreateObject();
+            if (telemetry == NULL) {
+                ESP_LOGE(TAG, "Failed to create JSON object");
+            } else {
+                /* Add telemetry fields */
+                char buf_temp[32];
+                snprintf(buf_temp, sizeof(buf_temp), "%.1f", device_temperature_c);
+                cJSON_AddStringToObject(telemetry, "tb", buf_temp);
+
+                if(bms != NULL){
+                    cJSON_AddNumberToObject(telemetry, "bV", bms->getPackVoltageMillivolts());
+                    cJSON_AddNumberToObject(telemetry, "bI", bms->getPackCurrentMilliamps());
+                    cJSON_AddNumberToObject(telemetry, "sc", (uint32_t)bms->getSoC());
+                    cJSON_AddNumberToObject(telemetry, "ec", bms->getEnergyConsumed());
+                }
+
+                /* Serialize to string */
+                char *json_str = cJSON_PrintUnformatted(telemetry);
+                if (json_str == NULL) {
+                    ESP_LOGE(TAG, "Failed to serialize JSON");
+                } else {
+                    /* Send telemetry via UART service */
+                    uart_service.sendTelemetry(json_str);
+                    cJSON_free(json_str);
+                }
+
+                cJSON_Delete(telemetry);
+            }
         }
 
-        /* Add telemetry fields */
-        char buf_temp[32];
-        snprintf(buf_temp, sizeof(buf_temp), "%.1f", device_temperature_c);
-        cJSON_AddStringToObject(telemetry, "tb", buf_temp);
-
-        if(bms != NULL){
-            cJSON_AddNumberToObject(telemetry, "bV", bms->getPackVoltageMillivolts());
-            cJSON_AddNumberToObject(telemetry, "bI", bms->getPackCurrentMilliamps());
-            cJSON_AddNumberToObject(telemetry, "sc", (uint32_t)bms->getSoC());
-            cJSON_AddNumberToObject(telemetry, "ec", bms->getEnergyConsumed());
-        }
-
-        /* Serialize to string */
-        char *json_str = cJSON_PrintUnformatted(telemetry);
-        if (json_str == NULL) {
-            ESP_LOGE(TAG, "Failed to serialize JSON");
-            cJSON_Delete(telemetry);
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
-
-        /* Send telemetry via UART service */
-        uart_service.sendTelemetry(json_str);
-
-        cJSON_free(json_str);
-        cJSON_Delete(telemetry);
-
-        /* Broadcast every 500ms */
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -1176,18 +1194,6 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "MCP2515 CAN controller initialized successfully at 500 kbps");
     }
 
-#if CONFIG_BT_NIMBLE_ENABLED
-    if (canBus != NULL) {
-        canalyzer = new CANAnalyzerStack(
-            can_console,
-            *canBus,
-            canalyzer_rx_buffer,
-            CANALYZER_RX_BUFFER_SIZE,
-            &canalyzer_rx_buffer_index,
-            canalyzer_get_millis);
-    }
-#endif
-
     nvs = new NVSStorage("bms");
     ESP_ERROR_CHECK(nvs->init());
 
@@ -1234,8 +1240,21 @@ extern "C" void app_main(void)
 
 #if CONFIG_BT_NIMBLE_ENABLED
     /* Initialize BLE and start telemetry task */
-    initialize_menu_system();
     ble_init();
+    if (canBus != NULL) {
+        canalyzer = new CANAnalyzerStack(
+            can_console,
+            *canBus,
+            canalyzer_rx_buffer,
+            CANALYZER_RX_BUFFER_SIZE,
+            &canalyzer_rx_buffer_index,
+            canalyzer_tx_buffer,
+            CANALYZER_TX_BUFFER_SIZE,
+            &canalyzer_tx_buffer_index,
+            canalyzer_get_millis,
+            canalyzer_tx_callback);
+    }
+    initialize_menu_system();
     xTaskCreate(menu_task, "ble_menu_task", 4096, NULL, 5, NULL);
     xTaskCreate(ble_telemetry_task, "ble_telemetry_task", 4096, NULL, 5, NULL);
 #endif
