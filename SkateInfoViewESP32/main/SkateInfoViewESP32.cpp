@@ -63,16 +63,13 @@ static const char *TAG = "skateinfo";
 #define PWR_LATCH_GPIO          GPIO_NUM_2
 #define ESC_PWR_SENSE_GPIO      GPIO_NUM_1
 
+// Board "BOOT" strap pin; free for use as a regular input once the app is running
+#define MODE_BUTTON_GPIO        GPIO_NUM_0
+
 #define HEADLIGHT_OUT_GPIO      GPIO_NUM_15
 #define HEADLIGHT_LEDC_CHANNEL  LEDC_CHANNEL_3
 #define BRAKELIGHT_OUT_GPIO     GPIO_NUM_16
 #define BRAKELIGHT_LEDC_CHANNEL LEDC_CHANNEL_4
-
-// Kinematics Macros
-//#define WHEEL_SIZE_MM        90
-#define WHEEL_SIZE_MM        103            // Size of wheel used for speed calculation from RPM. TODO: Configurable in NVS
-#define WHEEL_RPM_RATIO_L    1000
-#define WHEEL_RPM_RATIO_R    170
 
 
 // SPI pins for MCP2515 CAN Controller
@@ -115,6 +112,10 @@ static BLEOTAService ota_service;
 /* Separate UART service used by the CAN analyzer console. */
 static BLEUARTService can_console_uart_service(64);
 static BLESerialConsole can_console(can_console_uart_service);
+/* USB CDC console; only installed when BoardConfiguration selects STANDARD_MENU. */
+static USBSerialConsole usb_console;
+/* Combines BLE and USB transports; USB legs are inert until usb_console.begin() succeeds. */
+ISerialInterfaceCombiner console_combiner(&can_console, &usb_console);
 static constexpr uint16_t CANALYZER_RX_BUFFER_SIZE = 64;
 static CANMessage canalyzer_rx_buffer[CANALYZER_RX_BUFFER_SIZE];
 static uint16_t canalyzer_rx_buffer_index = 0;
@@ -135,10 +136,15 @@ static uint64_t canalyzer_get_millis()
     return static_cast<uint64_t>(esp_timer_get_time() / 1000);
 }
 
-static MenuItem root_menu("root");
+static void root_menu_on_enter()
+{
+    console_combiner.writeLine("Welcome to the SkateInfoView configuration menu");
+}
+
+static MenuItem root_menu("root", root_menu_on_enter);
 static void diagnostics_menu_on_enter()
 {
-    can_console.writeLine("Entered diagnostics menu");
+    console_combiner.writeLine("Entered diagnostics menu");
 }
 
 static void canalyzer_menu_on_enter()
@@ -178,6 +184,9 @@ static int state_of_charge = 0;
 static uint32_t pack_voltage_mv;
 static uint32_t last_integration_time_ms = 0;
 static volatile bool esc_powered = false;
+static volatile bool mode_button_pressed = false; // active-low Mode button on GPIO0
+static volatile bool mode_toggle_pending = false;
+static volatile int64_t mode_button_press_time_us = 0;
 static SemaphoreHandle_t pulse_mutex = NULL;
 
 // ADC handle for esp-idf v5 oneshot API
@@ -271,18 +280,30 @@ IntegratedBMS *bms = NULL;
 static const uint32_t pack_idle_current_ma = 200;
 
 INVSStorage *nvs = NULL;
-BoardConfiguration boardConfiguration{};
 
 static void board_configuration_task(void *arg)
 {
     (void)arg;
+    TickType_t last_save_tick = xTaskGetTickCount();
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(60000));
+        vTaskDelay(pdMS_TO_TICKS(2000));
 
+        const TickType_t now = xTaskGetTickCount();
+        const bool periodic_save_due =
+            (now - last_save_tick) >= pdMS_TO_TICKS(120000);
+        bool stale_save_claimed = false;
         if (nvs != NULL) {
+            stale_save_claimed =
+                __atomic_exchange_n(&board_configuration_stale, false, __ATOMIC_ACQ_REL);
+        }
+
+        if (nvs != NULL && (stale_save_claimed || periodic_save_due)) {
             esp_err_t err = board_configuration_save(*nvs, boardConfiguration);
-            if (err != ESP_OK) {
+            if (err == ESP_OK) {
+                last_save_tick = now;
+            } else {
+                __atomic_store_n(&board_configuration_stale, true, __ATOMIC_RELEASE);
                 ESP_LOGE(TAG, "Failed to save board configuration: %s", esp_err_to_name(err));
             }
         }
@@ -333,31 +354,79 @@ static void IRAM_ATTR hall_isr_handler(void *arg)
     switch (gpio_num)
     {
     case HALL_LEFT_A_GPIO:
-        pulse_count_left_A++;
+        pulse_count_left_A = pulse_count_left_A + 1;
         break;
     case HALL_LEFT_B_GPIO:
-        pulse_count_left_B++;
+        pulse_count_left_B = pulse_count_left_B + 1;
         break;
     case HALL_LEFT_C_GPIO:
-        pulse_count_left_C++;
+        pulse_count_left_C = pulse_count_left_C + 1;
         break;
     case HALL_RIGHT_A_GPIO:
-        pulse_count_right_A++;
+        pulse_count_right_A = pulse_count_right_A + 1;
         break;
     case HALL_RIGHT_B_GPIO:
-        pulse_count_right_B++;
+        pulse_count_right_B = pulse_count_right_B + 1;
         break;
     case HALL_RIGHT_C_GPIO:
-        pulse_count_right_C++;
+        pulse_count_right_C = pulse_count_right_C + 1;
         break;
     default:
         break;
     }
 }
 
+// Apply a pending mode change from task context.
+static void toggle_uart_mode()
+{
+    boardConfiguration.uartConfig = (boardConfiguration.uartConfig == STANDARD_MENU)
+                                         ? STANDARD_ESPLOG
+                                         : STANDARD_MENU;
+    __atomic_store_n(&board_configuration_stale, true, __ATOMIC_RELEASE);
+
+#if CONFIG_BT_NIMBLE_ENABLED
+    if (boardConfiguration.uartConfig == STANDARD_MENU) {
+        if (!usb_console.begin()) {
+            ESP_LOGE(TAG, "Failed to initialize USB serial console");
+        }
+        esp_log_level_set("*", ESP_LOG_NONE);
+    } else {
+        esp_log_level_set("*", ESP_LOG_INFO);
+        ESP_LOGI(TAG, "USB Serial/JTAG reserved for OpenOCD debug console");
+    }
+#endif
+}
+
+static void IRAM_ATTR mode_button_isr_handler(void *arg)
+{
+    static volatile int64_t last_isr_time_us = 0;
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us - last_isr_time_us < 10000) {
+        return;
+    }
+    last_isr_time_us = now_us;
+
+    const bool pressed = (gpio_get_level(MODE_BUTTON_GPIO) == 0); // active-low button
+    mode_button_pressed = pressed;
+
+    if (pressed) {
+        mode_button_press_time_us = now_us;
+    } else {
+        // A release within one second is a short press; defer the mode change.
+        if (now_us - mode_button_press_time_us > 3000000) {
+            __atomic_store_n(&mode_toggle_pending, true, __ATOMIC_RELEASE);
+        }
+    }
+}
+
 static void rpm_task(void *arg)
 {
-    (void)arg;
+    const BoardConfiguration* configuration = static_cast<const BoardConfiguration*>(arg);
+    if (configuration == nullptr) {
+        vTaskDelete(nullptr);
+        return;
+    }
+
     static int64_t last_time_us = esp_timer_get_time();
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000)); // every second
@@ -376,10 +445,41 @@ static void rpm_task(void *arg)
         pulses_right_C = __atomic_exchange_n(&pulse_count_right_C, 0U, __ATOMIC_ACQ_REL);
 
         // Compute revolutions during the interval
-        uint32_t pulses_left_total = pulses_left_A + pulses_left_B + pulses_left_C;
-        uint32_t pulses_right_total = pulses_right_A + pulses_right_B + pulses_right_C;
-        double revs_left = (double)pulses_left_total / (double)WHEEL_RPM_RATIO_L;
-        double revs_right = (double)pulses_right_total / (double)WHEEL_RPM_RATIO_R;
+        const uint8_t motor_enable_mask =
+        configuration->motorSenseConfiguration.motorEnableMask;
+        uint32_t pulses_left_total = 0;
+        uint32_t pulses_right_total = 0;
+
+        if ((motor_enable_mask & (1U << 0)) != 0) {
+            pulses_left_total += pulses_left_A;
+        }
+        if ((motor_enable_mask & (1U << 1)) != 0) {
+            pulses_left_total += pulses_left_B;
+        }
+        if ((motor_enable_mask & (1U << 2)) != 0) {
+            pulses_left_total += pulses_left_C;
+        }
+        if ((motor_enable_mask & (1U << 3)) != 0) {
+            pulses_right_total += pulses_right_A;
+        }
+        if ((motor_enable_mask & (1U << 4)) != 0) {
+            pulses_right_total += pulses_right_B;
+        }
+        if ((motor_enable_mask & (1U << 5)) != 0) {
+            pulses_right_total += pulses_right_C;
+        }
+        const MotorSenseConfiguration& motor_configuration =
+            configuration->motorSenseConfiguration;
+        double revs_left = 0.0;
+        double revs_right = 0.0;
+        if (motor_configuration.motor1PulsesPerRevolution > 0) {
+            revs_left = (double)pulses_left_total /
+                        (double)motor_configuration.motor1PulsesPerRevolution;
+        }
+        if (motor_configuration.motor2PulsesPerRevolution > 0) {
+            revs_right = (double)pulses_right_total /
+                         (double)motor_configuration.motor2PulsesPerRevolution;
+        }
 
         // RPS and RPM
         double rps_left = revs_left / dt_s;
@@ -391,18 +491,24 @@ static void rpm_task(void *arg)
         rev_count_left += (uint32_t)revs_left;
         rev_count_right += (uint32_t)revs_right;
 
-        // Average RPM across both wheels
-        avg_rpm = rpm_right;//(((double)rpm_left) + ((double)rpm_right)) / 2.0;
+        // Use both wheels when available, otherwise use the active wheel.
+        if (rpm_left > 0 && rpm_right > 0) {
+            avg_rpm = (rpm_left + rpm_right) / 2;
+        } else if (rpm_left > 0) {
+            avg_rpm = rpm_left;
+        } else {
+            avg_rpm = rpm_right;
+        }
 
-        // Compute speed (assume WHEEL_SIZE_MM is diameter in mm -> circumference = pi * d)
-        double wheel_circ_m = (WHEEL_SIZE_MM / 1000.0) * M_PI;
+        // Compute speed (assume wheelSizeMillimeterTenths is diameter in 0.1 mm units -> circumference = pi * d)
+        double wheel_circ_m = ((double)configuration->wheelSizeMillimeterTenths / 10000.0) * M_PI;
         double avg_rps = avg_rpm / 60.0;
         double speed_m_per_s = avg_rps * wheel_circ_m;
         // Convert m/s to MPH (1 m/s = 2.2369362920544 mph)
         speed_mph = speed_m_per_s * 2.2369362920544;
 
-        // Integrate distance (meters)
-        trip_distance_miles += (speed_mph * dt_s) / 3600.0;
+        // Integrate distance directly from meters to miles.
+        trip_distance_miles += (speed_m_per_s * dt_s) / 1609.344;
     }
 }
 
@@ -589,22 +695,24 @@ static void canbus_task(void *arg)
 
 static void initialize_menu_system()
 {
+    board_configuration_menu_initialize();
+    root_menu.addCommand("board", &board_configuration_menu, nullptr);
     root_menu.addCommand("help", nullptr, [](std::string*) {
-        can_console.writeLine("Commands: help, status, diagnostics");
+        console_combiner.writeLine("Commands: help, status, board, diagnostics");
     });
     root_menu.addCommand("status", nullptr, [](std::string* command) {
-        can_console.writeLine(std::string("Status action received: ") + *command);
+        console_combiner.writeLine(std::string("Status action received: ") + *command);
     });
     root_menu.addCommand("diagnostics", &diagnostics_menu, nullptr);
 
     diagnostics_menu.addCommand("hello", nullptr, [](std::string*) {
-        can_console.writeLine("Hello from the nested diagnostics menu");
+        console_combiner.writeLine("Hello from the nested diagnostics menu");
     });
     diagnostics_menu.addCommand("echo", nullptr, [](std::string* command) {
-        can_console.writeLine(std::string("Echo: ") + *command);
+        console_combiner.writeLine(std::string("Echo: ") + *command);
     });
     diagnostics_menu.addCommand("help", nullptr, [](std::string*) {
-        can_console.writeLine("Diagnostics commands: hello, echo, back, root");
+        console_combiner.writeLine("Diagnostics commands: hello, echo, back, root");
     });
     if (canalyzer != nullptr) {
         canalyzer->canalyzerMenu()->setOnEnter(canalyzer_menu_on_enter);
@@ -618,10 +726,10 @@ static void menu_task(void *arg)
 
     while (1) {
         std::vector<std::string> console_lines;
-        if (can_console.processLines(console_lines)) {
+        if (console_combiner.processLines(console_lines)) {
             for (const std::string& line : console_lines) {
                 if (!menu_system.processCommand(line)) {
-                    can_console.writeLine(std::string("Unknown menu command: ") + line);
+                    console_combiner.writeLine(std::string("Unknown menu command: ") + line);
                 }
             }
         }
@@ -797,17 +905,20 @@ static void power_control_task(void *arg){
         esc_powered = gpio_get_level(ESC_PWR_SENSE_GPIO);
         //esc_powered = (rpm_left > 0) || (rpm_right > 0);
 
+        // Menu/debug UART mode gets a lighter shade of the same hue
+        const uint8_t base_r = (boardConfiguration.uartConfig == STANDARD_MENU) ? 64 : 0;
+
         if(esc_powered){
             color.b = 255;
             color.g = 255;
-            color.r = 0;
+            color.r = base_r;
 
             last_esc_on_time = xTaskGetTickCount();
         }
         else{
             color.b = 0;
             color.g = 255;
-            color.r = 0;
+            color.r = base_r;
 
             if(pdTICKS_TO_MS(xTaskGetTickCount() - last_esc_on_time) > IDLE_POWEROFF_MS){
                 color.b = 0;
@@ -887,6 +998,10 @@ static void ble_telemetry_task(void *arg)
     TickType_t last_telemetry_tick = xTaskGetTickCount();
 
     while (1) {
+        if (__atomic_exchange_n(&mode_toggle_pending, false, __ATOMIC_ACQ_REL)) {
+            toggle_uart_mode();
+        }
+
         uart_service.send_queue_messages();
         can_console_uart_service.send_queue_messages();
 
@@ -901,6 +1016,22 @@ static void ble_telemetry_task(void *arg)
                 char buf_temp[32];
                 snprintf(buf_temp, sizeof(buf_temp), "%.1f", device_temperature_c);
                 cJSON_AddStringToObject(telemetry, "tb", buf_temp);
+                cJSON_AddNumberToObject(telemetry, "pLA", pulses_left_A);
+                cJSON_AddNumberToObject(telemetry, "pLB", pulses_left_B);
+                cJSON_AddNumberToObject(telemetry, "pLC", pulses_left_C);
+                cJSON_AddNumberToObject(telemetry, "pRA", pulses_right_A);
+                cJSON_AddNumberToObject(telemetry, "pRB", pulses_right_B);
+                cJSON_AddNumberToObject(telemetry, "pRC", pulses_right_C);
+                cJSON_AddNumberToObject(telemetry, "pL", pulses_left_A + pulses_left_B + pulses_left_C);
+                cJSON_AddNumberToObject(telemetry, "pR", pulses_right_A + pulses_right_B + pulses_right_C);
+                cJSON_AddNumberToObject(telemetry, "rL", rpm_left);
+                cJSON_AddNumberToObject(telemetry, "rR", rpm_right);
+                char buf_speed[32];
+                snprintf(buf_speed, sizeof(buf_speed), "%.1f", speed_mph);
+                cJSON_AddRawToObject(telemetry, "spd", buf_speed);
+                char buf_odometer[32];
+                snprintf(buf_odometer, sizeof(buf_odometer), "%.2f", trip_distance_miles);
+                cJSON_AddRawToObject(telemetry, "odo", buf_odometer);
 
                 if(bms != NULL){
                     cJSON_AddNumberToObject(telemetry, "bV", bms->getPackVoltageMillivolts());
@@ -1041,6 +1172,19 @@ static void configurePowerSenseGPIO(gpio_num_t gpio){
     gpio_config(&io_conf);
 }
 
+static void configureModeButtonGPIO(gpio_num_t gpio){
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_ANYEDGE,
+    };
+    gpio_config(&io_conf);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(gpio, mode_button_isr_handler, (void*)(intptr_t)gpio);
+}
+
 static void configureHallGPIO(gpio_num_t gpio){
     /* Configure hall GPIO */
     gpio_config_t io_conf = {
@@ -1161,6 +1305,7 @@ extern "C" void app_main(void)
     configureHallGPIO(HALL_RIGHT_C_GPIO);
 
     configurePowerSenseGPIO(ESC_PWR_SENSE_GPIO);
+    configureModeButtonGPIO(MODE_BUTTON_GPIO);
 
     adc_init();
    
@@ -1202,6 +1347,19 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "Failed to load board configuration: %s", esp_err_to_name(board_configuration_err));
     }
 
+#if CONFIG_BT_NIMBLE_ENABLED
+    // Only claim the USB Serial/JTAG peripheral for the menu console when requested;
+    // otherwise leave it free for esp_log output and OpenOCD debugging.
+    if (boardConfiguration.uartConfig == STANDARD_MENU) {
+        if (!usb_console.begin()) {
+            ESP_LOGE(TAG, "Failed to initialize USB serial console");
+        }
+        esp_log_level_set("*", ESP_LOG_NONE);
+    } else {
+        ESP_LOGI(TAG, "USB Serial/JTAG reserved for OpenOCD debug console");
+    }
+#endif
+
     BatteryConfiguration default_battery_config{
         .crc32 = 0,
         .battery_curve_mv = { 3100, 3300, 3425, 3550, 3625, 3700, 3775, 3850, 3925, 4000, 4100 },
@@ -1229,7 +1387,7 @@ extern "C" void app_main(void)
     xTaskCreate(board_configuration_task, "board_config", 2048, NULL, 4, NULL);
 
     /* Start sensor and rpm tasks */
-    xTaskCreate(rpm_task, "rpm_task", 4096, NULL, 5, NULL);
+    xTaskCreate(rpm_task, "rpm_task", 4096, &boardConfiguration, 5, NULL);
     // ADC sampler runs faster and provides averaged raw ADC values for accessories
     xTaskCreate(adc_sampler_task, "adc_sampler", 2048, NULL, 6, NULL);
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
@@ -1243,7 +1401,7 @@ extern "C" void app_main(void)
     ble_init();
     if (canBus != NULL) {
         canalyzer = new CANAnalyzerStack(
-            can_console,
+            console_combiner,
             *canBus,
             canalyzer_rx_buffer,
             CANALYZER_RX_BUFFER_SIZE,
