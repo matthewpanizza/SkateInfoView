@@ -35,6 +35,7 @@
 #include "RGB_LED.h"
 #include "TCS34725.h"
 #include "BoardConfiguration.h"
+#include "ESPCANController.h"
 #include "MCP2515_CANController.h"
 #include "TMP117.h"
 #include "driver/i2c_master.h"
@@ -77,6 +78,10 @@ static const char *TAG = "skateinfo";
 #define SPI_MISO_PIN         GPIO_NUM_12
 #define SPI_CLK_PIN          GPIO_NUM_14
 #define SPI_CS_PIN           GPIO_NUM_11
+
+// TX/RX pins for integrated ESP2 CAN Controller
+#define ESP_CANRX            GPIO_NUM_12
+#define ESP_CANTX            GPIO_NUM_13
 
 // ADC channels (update to match new wiring)
 #define ADC_BATT_CHANNEL     ADC_CHANNEL_4  // ADC1_4 is actually IO5. For battery voltage
@@ -202,6 +207,9 @@ static float device_temperature_c = 0.0f;
 static float accessory_current_12v_ma = 0.0f;
 static float accessory_current_5v_ma = 0.0f;
 static float accessory_watts = 0.0f;
+static volatile float battery_current_ma = 0.0f;
+static uint8_t headlight_duty_cycle = 128;
+static uint8_t brake_light_duty_cycle = 0;
 
 struct SkateInfoState {
     uint32_t pack_voltage_mv = 0;
@@ -213,13 +221,7 @@ struct SkateInfoState {
 };
 
 SkateInfoState skateInfoState;
-static MCP2515_CANController *canBus = NULL;
-
-// Accessory calibration constants (tweak as needed)
-static const float ACC_12V_VOLTAGE = 12.0f;
-static const float ACC_5V_VOLTAGE = 5.0f;
-static const float ACC_SHUNT_RATIO_12V = 220.0f; // default, adjust per hardware
-static const float ACC_SHUNT_RATIO_5V = 220.0f;  // default, adjust per hardware
+static ICANController *canBus = NULL;
 
 // Smoothed ADC raw averages provided by the ADC sampler task
 // Raw averaged ADC values stored as integer decimals (atomic uint32)
@@ -528,7 +530,7 @@ static void sensor_task(void *arg)
         uint32_t ref_adc = __atomic_load_n(&adc_avg_curr_ref_bits, __ATOMIC_RELAXED);
         raw_curr = (float)hs_adc;
         ref = (float)ref_adc;
-        
+
         // Use averaged raw ADC values produced by adc_sampler_task
         float raw_12v_avg; 
         float raw_5v_avg;
@@ -584,8 +586,16 @@ static void sensor_task(void *arg)
         static int acc5_count = 0;
 
         // Convert averaged raw ADC to mA for accessories (use sampler's 10-sample average)
-        float acc12_mA_instant = (raw_12v_avg * 1000.0f / ACC_SHUNT_RATIO_12V);
-        float acc5_mA_instant = (raw_5v_avg * 1000.0f / ACC_SHUNT_RATIO_5V);
+        const PowerSystemConfiguration& power_configuration =
+            boardConfiguration.powerSystemConfiguration;
+        float acc12_mA_instant = power_configuration.adc_counts_per_amp_12V == 0
+                                     ? 0.0f
+                                     : (raw_12v_avg * 1000.0f /
+                                        static_cast<float>(power_configuration.adc_counts_per_amp_12V));
+        float acc5_mA_instant = power_configuration.adc_counts_per_amp_5V == 0
+                                    ? 0.0f
+                                    : (raw_5v_avg * 1000.0f /
+                                       static_cast<float>(power_configuration.adc_counts_per_amp_5V));
 
         acc12_buf[acc12_idx] = acc12_mA_instant;
         acc12_idx = (acc12_idx + 1) % ACC_CURR_BUF_SIZE;
@@ -604,23 +614,21 @@ static void sensor_task(void *arg)
         if (acc5_count > 0) accessory_current_5v_ma /= (float)acc5_count;
 
         // Compute accessory power (watts) = sum( I(A) * V )
-        accessory_watts = (accessory_current_12v_ma / 1000.0f) * ACC_12V_VOLTAGE + (accessory_current_5v_ma / 1000.0f) * ACC_5V_VOLTAGE;
+        accessory_watts =
+            (accessory_current_12v_ma / 1000.0f) *
+                (static_cast<float>(power_configuration.voltage_12V_millivolts) / 1000.0f) +
+            (accessory_current_5v_ma / 1000.0f) *
+                (static_cast<float>(power_configuration.voltage_5V_millivolts) / 1000.0f);
 
         float battCurrentmA = 0.0f;
         for (int i = 0; i < curr_count; ++i) battCurrentmA += curr_buf[i];
         if (curr_count > 0) battCurrentmA /= (float)curr_count;
+        battery_current_ma = battCurrentmA;
 
         if(bms != NULL){
             bms->update(-(int32_t)battCurrentmA, batteryVoltage, 25.0f);
             mAH_consumption = (float)bms->getEnergyConsumed();
             state_of_charge = (int)bms->getSoC();
-        }
-
-        if (tmp117_sensor != NULL) {
-            esp_err_t ret = tmp117_sensor->readTemperature(&device_temperature_c);
-            if (ret != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to read TMP117 temperature: %s", esp_err_to_name(ret));
-            }
         }
 
         ESP_LOGI(TAG, "5V_raw=%.1f 5V_A=%.1f 12V_raw=%.1f 12V_A=%.1f", raw_5v_avg, accessory_current_5v_ma, raw_12v_avg, accessory_current_12v_ma);
@@ -629,6 +637,22 @@ static void sensor_task(void *arg)
 
         /* Store current sensor values for telemetry task */
         /* (These are static globals used by ble_telemetry_task) */
+
+        vTaskDelay(pdMS_TO_TICKS(RPM_POLL_MS));
+    }
+}
+
+static void tmp117_sensor_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        if (tmp117_sensor != NULL) {
+            esp_err_t ret = tmp117_sensor->readTemperature(&device_temperature_c);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to read TMP117 temperature: %s", esp_err_to_name(ret));
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(RPM_POLL_MS));
     }
@@ -693,12 +717,174 @@ static void canbus_task(void *arg)
 
 #if CONFIG_BT_NIMBLE_ENABLED
 
+static bool hardware_feature_is_enabled(uint8_t index)
+{
+    switch (index) {
+        case 0: return boardConfiguration.hardwareFeatureEnable.feature0;
+        case 1: return boardConfiguration.hardwareFeatureEnable.feature1;
+        case 2: return boardConfiguration.hardwareFeatureEnable.feature2;
+        case 3: return boardConfiguration.hardwareFeatureEnable.feature3;
+        case 4: return boardConfiguration.hardwareFeatureEnable.feature4;
+        case 5: return boardConfiguration.hardwareFeatureEnable.feature5;
+        case 6: return boardConfiguration.hardwareFeatureEnable.feature6;
+        case 7: return boardConfiguration.hardwareFeatureEnable.feature7;
+        case 8: return boardConfiguration.hardwareFeatureEnable.feature8;
+        case 9: return boardConfiguration.hardwareFeatureEnable.feature9;
+        case 10: return boardConfiguration.hardwareFeatureEnable.feature10;
+        case 11: return boardConfiguration.hardwareFeatureEnable.feature11;
+        case 12: return boardConfiguration.hardwareFeatureEnable.feature12;
+        case 13: return boardConfiguration.hardwareFeatureEnable.feature13;
+        case 14: return boardConfiguration.hardwareFeatureEnable.feature14;
+        case 15: return boardConfiguration.hardwareFeatureEnable.tmp117SensorEnabled;
+        case 16: return boardConfiguration.hardwareFeatureEnable.canbusEnabled;
+        case 17: return boardConfiguration.hardwareFeatureEnable.useMCP2515;
+        case 18: return boardConfiguration.hardwareFeatureEnable.motorSenseEnable;
+        default: return false;
+    }
+}
+
+static void toggle_hardware_feature(uint8_t index)
+{
+    switch (index) {
+        case 0: boardConfiguration.hardwareFeatureEnable.feature0 = !boardConfiguration.hardwareFeatureEnable.feature0; break;
+        case 1: boardConfiguration.hardwareFeatureEnable.feature1 = !boardConfiguration.hardwareFeatureEnable.feature1; break;
+        case 2: boardConfiguration.hardwareFeatureEnable.feature2 = !boardConfiguration.hardwareFeatureEnable.feature2; break;
+        case 3: boardConfiguration.hardwareFeatureEnable.feature3 = !boardConfiguration.hardwareFeatureEnable.feature3; break;
+        case 4: boardConfiguration.hardwareFeatureEnable.feature4 = !boardConfiguration.hardwareFeatureEnable.feature4; break;
+        case 5: boardConfiguration.hardwareFeatureEnable.feature5 = !boardConfiguration.hardwareFeatureEnable.feature5; break;
+        case 6: boardConfiguration.hardwareFeatureEnable.feature6 = !boardConfiguration.hardwareFeatureEnable.feature6; break;
+        case 7: boardConfiguration.hardwareFeatureEnable.feature7 = !boardConfiguration.hardwareFeatureEnable.feature7; break;
+        case 8: boardConfiguration.hardwareFeatureEnable.feature8 = !boardConfiguration.hardwareFeatureEnable.feature8; break;
+        case 9: boardConfiguration.hardwareFeatureEnable.feature9 = !boardConfiguration.hardwareFeatureEnable.feature9; break;
+        case 10: boardConfiguration.hardwareFeatureEnable.feature10 = !boardConfiguration.hardwareFeatureEnable.feature10; break;
+        case 11: boardConfiguration.hardwareFeatureEnable.feature11 = !boardConfiguration.hardwareFeatureEnable.feature11; break;
+        case 12: boardConfiguration.hardwareFeatureEnable.feature12 = !boardConfiguration.hardwareFeatureEnable.feature12; break;
+        case 13: boardConfiguration.hardwareFeatureEnable.feature13 = !boardConfiguration.hardwareFeatureEnable.feature13; break;
+        case 14: boardConfiguration.hardwareFeatureEnable.feature14 = !boardConfiguration.hardwareFeatureEnable.feature14; break;
+        case 15: boardConfiguration.hardwareFeatureEnable.tmp117SensorEnabled = !boardConfiguration.hardwareFeatureEnable.tmp117SensorEnabled; break;
+        case 16: boardConfiguration.hardwareFeatureEnable.canbusEnabled = !boardConfiguration.hardwareFeatureEnable.canbusEnabled; break;
+        case 17: boardConfiguration.hardwareFeatureEnable.useMCP2515 = !boardConfiguration.hardwareFeatureEnable.useMCP2515; break;
+        case 18: boardConfiguration.hardwareFeatureEnable.motorSenseEnable = !boardConfiguration.hardwareFeatureEnable.motorSenseEnable; break;
+        default: break;
+    }
+}
+
+static void set_hardware_feature(uint8_t index, bool enabled)
+{
+    switch (index) {
+        case 15: boardConfiguration.hardwareFeatureEnable.tmp117SensorEnabled = enabled; break;
+        case 16: boardConfiguration.hardwareFeatureEnable.canbusEnabled = enabled; break;
+        case 17: boardConfiguration.hardwareFeatureEnable.useMCP2515 = enabled; break;
+        case 18: boardConfiguration.hardwareFeatureEnable.motorSenseEnable = enabled; break;
+        default: break;
+    }
+}
+
+static void add_hardware_feature_command(MenuItem& menu, std::string name, uint8_t index)
+{
+    menu.addCommand(name, nullptr, [name, index](std::string* command) {
+        const std::string argument = command->size() > name.size() &&
+                                             command->compare(0, name.size(), name) == 0 &&
+                                             (*command)[name.size()] == ' '
+                                         ? command->substr(name.size() + 1)
+                                         : "";
+        bool enabled = hardware_feature_is_enabled(index);
+        if (*command == name || argument == "toggle") {
+            toggle_hardware_feature(index);
+            enabled = hardware_feature_is_enabled(index);
+        } else if (argument == "true" || argument == "on") {
+            set_hardware_feature(index, true);
+            enabled = true;
+        } else if (argument == "false" || argument == "off") {
+            set_hardware_feature(index, false);
+            enabled = false;
+        } else {
+            console_combiner.writeLine("Usage: " + name + " toggle|true|false (current: " +
+                                       (enabled ? "enabled" : "disabled") + ")");
+            return;
+        }
+
+        __atomic_store_n(&board_configuration_stale, true, __ATOMIC_RELEASE);
+        console_combiner.writeLine(name + " set to " + (enabled ? "enabled" : "disabled"));
+    });
+}
+
+static void add_hardware_feature_alias(MenuItem& menu, std::string name, uint8_t index)
+{
+    add_hardware_feature_command(menu, name, index);
+}
+
+static void hardware_features_menu_on_enter()
+{
+    console_combiner.writeLine("Hardware feature toggles:");
+    for (uint8_t index = 0; index < 15; ++index) {
+        console_combiner.writeLine("  feature" + std::to_string(index) + "=" +
+                                   (hardware_feature_is_enabled(index) ? "enabled" : "disabled"));
+    }
+    console_combiner.writeLine("  tmp117SensorEnabled=" +
+                               std::string(hardware_feature_is_enabled(15) ? "enabled" : "disabled"));
+    console_combiner.writeLine("  canbusEnabled=" +
+                               std::string(hardware_feature_is_enabled(16) ? "enabled" : "disabled"));
+    console_combiner.writeLine("  useMCP2515=" +
+                               std::string(hardware_feature_is_enabled(17) ? "enabled" : "disabled"));
+    console_combiner.writeLine("  motorSenseEnable=" +
+                               std::string(hardware_feature_is_enabled(18) ? "enabled" : "disabled"));
+}
+
 static void initialize_menu_system()
 {
+    static MenuItem hardware_features_menu("features", hardware_features_menu_on_enter);
+    for (uint8_t index = 0; index < 15; ++index) {
+        add_hardware_feature_command(hardware_features_menu,
+                                     (std::string("feature") + std::to_string(index)).c_str(),
+                                     index);
+    }
+    add_hardware_feature_command(hardware_features_menu, "tmp117SensorEnabled", 15);
+    add_hardware_feature_command(hardware_features_menu, "canbusEnabled", 16);
+    add_hardware_feature_alias(hardware_features_menu, "canbusEnable", 16);
+    add_hardware_feature_command(hardware_features_menu, "useMCP2515", 17);
+    add_hardware_feature_command(hardware_features_menu, "motorSenseEnable", 18);
+    root_menu.addCommand("features", &hardware_features_menu, nullptr);
+    static MenuItem power_menu("power");
+    power_menu.addCommand("headlight", nullptr, [](std::string* command) {
+        const size_t name_length = strlen("headlight");
+        if (*command == "headlight") {
+            console_combiner.writeLine("Usage: headlight <duty 0-255> (current: " +
+                                       std::to_string(headlight_duty_cycle) + ")");
+            return;
+        }
+
+        char* end = nullptr;
+        const unsigned long value = strtoul(command->c_str() + name_length, &end, 0);
+        if (command->compare(0, name_length, "headlight") == 0 &&
+            command->size() > name_length && (*command)[name_length] == ' ' &&
+            end != command->c_str() + name_length && *end == '\0' && value <= UINT8_MAX) {
+            headlight_duty_cycle = static_cast<uint8_t>(value);
+            console_combiner.writeLine("Headlight duty set to " + std::to_string(value));
+        }
+    });
+    power_menu.addCommand("brake", nullptr, [](std::string* command) {
+        const size_t name_length = strlen("brake");
+        if (*command == "brake") {
+            console_combiner.writeLine("Usage: brake <duty 0-255> (current: " +
+                                       std::to_string(brake_light_duty_cycle) + ")");
+            return;
+        }
+
+        char* end = nullptr;
+        const unsigned long value = strtoul(command->c_str() + name_length, &end, 0);
+        if (command->compare(0, name_length, "brake") == 0 &&
+            command->size() > name_length && (*command)[name_length] == ' ' &&
+            end != command->c_str() + name_length && *end == '\0' && value <= UINT8_MAX) {
+            brake_light_duty_cycle = static_cast<uint8_t>(value);
+            console_combiner.writeLine("Brake light duty set to " + std::to_string(value));
+        }
+    });
+    root_menu.addCommand("power", &power_menu, nullptr);
     board_configuration_menu_initialize();
     root_menu.addCommand("board", &board_configuration_menu, nullptr);
     root_menu.addCommand("help", nullptr, [](std::string*) {
-        console_combiner.writeLine("Commands: help, status, board, diagnostics");
+        console_combiner.writeLine("Commands: help, status, board, power, features, diagnostics");
     });
     root_menu.addCommand("status", nullptr, [](std::string* command) {
         console_combiner.writeLine(std::string("Status action received: ") + *command);
@@ -902,7 +1088,23 @@ static void power_control_task(void *arg){
         /* Process any pending BLE control commands */
         ble_process_command_queue();
 
-        esc_powered = gpio_get_level(ESC_PWR_SENSE_GPIO);
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, HEADLIGHT_LEDC_CHANNEL,
+                                      headlight_duty_cycle));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, HEADLIGHT_LEDC_CHANNEL));
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BRAKELIGHT_LEDC_CHANNEL,
+                                      brake_light_duty_cycle));
+        ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BRAKELIGHT_LEDC_CHANNEL));
+
+        if(boardConfiguration.hardwareFeatureEnable.motorSenseEnable)
+        {
+            esc_powered = gpio_get_level(ESC_PWR_SENSE_GPIO);
+        }
+        else
+        {
+            esc_powered = fabsf(battery_current_ma) > 1000.0f;
+        }
+
+
         //esc_powered = (rpm_left > 0) || (rpm_right > 0);
 
         // Menu/debug UART mode gets a lighter shade of the same hue
@@ -1032,6 +1234,13 @@ static void ble_telemetry_task(void *arg)
                 char buf_odometer[32];
                 snprintf(buf_odometer, sizeof(buf_odometer), "%.2f", trip_distance_miles);
                 cJSON_AddRawToObject(telemetry, "odo", buf_odometer);
+                char buf_accessory_watts[32];
+                snprintf(buf_accessory_watts, sizeof(buf_accessory_watts), "%.1f", accessory_watts);
+                cJSON_AddRawToObject(telemetry, "accessory_watts", buf_accessory_watts);
+                cJSON_AddNumberToObject(telemetry, "accessory_current_12v_ma",
+                                        static_cast<int>(accessory_current_12v_ma));
+                cJSON_AddNumberToObject(telemetry, "accessory_current_5v_ma",
+                                        static_cast<int>(accessory_current_5v_ma));
 
                 if(bms != NULL){
                     cJSON_AddNumberToObject(telemetry, "bV", bms->getPackVoltageMillivolts());
@@ -1262,6 +1471,12 @@ extern "C" void app_main(void)
 
     // Initialize UART for ISO communications (uses `UART_ISO_TX`/`UART_ISO_RX`)
     uart_iso_init();
+    nvs = new NVSStorage("bms");
+    ESP_ERROR_CHECK(nvs->init());
+    esp_err_t board_configuration_err = board_configuration_load(*nvs, boardConfiguration);
+    if (board_configuration_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to load board configuration: %s", esp_err_to_name(board_configuration_err));
+    }
 
     // Initialize I2C bus (SDA on IO10, SCL on IO9) for TMP117 and SSD1306 OLED
     i2c_master_bus_config_t i2c_mst_config = {
@@ -1280,31 +1495,34 @@ extern "C" void app_main(void)
     // Longer delay to ensure I2C bus is ready
     vTaskDelay(pdMS_TO_TICKS(100));
     
-    // Probe I2C bus first to verify hardware is present
-    esp_err_t probe_ret = i2c_master_probe(i2c_bus_handle, 0x48, -1);
-    if (probe_ret != ESP_OK) {
-        ESP_LOGW(TAG, "I2C probe failed for TMP117 at 0x48: %s (device may not be connected)", esp_err_to_name(probe_ret));
-    } else {
-        ESP_LOGI(TAG, "I2C probe successful - TMP117 device found at 0x48");
+    if (boardConfiguration.hardwareFeatureEnable.tmp117SensorEnabled) {
+        // Probe I2C bus first to verify hardware is present
+        esp_err_t probe_ret = i2c_master_probe(i2c_bus_handle, 0x48, -1);
+        if (probe_ret != ESP_OK) {
+            ESP_LOGW(TAG, "I2C probe failed for TMP117 at 0x48: %s (device may not be connected)", esp_err_to_name(probe_ret));
+        } else {
+            ESP_LOGI(TAG, "I2C probe successful - TMP117 device found at 0x48");
+        }
+
+        // Initialize TMP117 temperature sensor on shared I2C bus
+        tmp117_sensor = new TMP117(i2c_bus_handle, 0x48);  // Default TMP117 address
+        esp_err_t tmp117_ret = tmp117_sensor->init();
+        if (tmp117_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to initialize TMP117 sensor: %s", esp_err_to_name(tmp117_ret));
+        } else {
+            ESP_LOGI(TAG, "TMP117 temperature sensor initialized successfully");
+        }
     }
 
-    // Initialize TMP117 temperature sensor on shared I2C bus
-    tmp117_sensor = new TMP117(i2c_bus_handle, 0x48);  // Default TMP117 address
-    esp_err_t tmp117_ret = tmp117_sensor->init();
-    if (tmp117_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to initialize TMP117 sensor: %s", esp_err_to_name(tmp117_ret));
-    } else {
-        ESP_LOGI(TAG, "TMP117 temperature sensor initialized successfully");
+    if (boardConfiguration.hardwareFeatureEnable.motorSenseEnable) {
+        configureHallGPIO(HALL_LEFT_A_GPIO);
+        configureHallGPIO(HALL_LEFT_B_GPIO);
+        configureHallGPIO(HALL_LEFT_C_GPIO);
+        configureHallGPIO(HALL_RIGHT_A_GPIO);
+        configureHallGPIO(HALL_RIGHT_B_GPIO);
+        configureHallGPIO(HALL_RIGHT_C_GPIO);
+        configurePowerSenseGPIO(ESC_PWR_SENSE_GPIO);
     }
-
-    configureHallGPIO(HALL_LEFT_A_GPIO);
-    configureHallGPIO(HALL_LEFT_B_GPIO);
-    configureHallGPIO(HALL_LEFT_C_GPIO);
-    configureHallGPIO(HALL_RIGHT_A_GPIO);
-    configureHallGPIO(HALL_RIGHT_B_GPIO);
-    configureHallGPIO(HALL_RIGHT_C_GPIO);
-
-    configurePowerSenseGPIO(ESC_PWR_SENSE_GPIO);
     configureModeButtonGPIO(MODE_BUTTON_GPIO);
 
     adc_init();
@@ -1312,39 +1530,41 @@ extern "C" void app_main(void)
     ESP32LED::configurePWMPin(HEADLIGHT_OUT_GPIO, HEADLIGHT_LEDC_CHANNEL);
     ESP32LED::configurePWMPin(BRAKELIGHT_OUT_GPIO, BRAKELIGHT_LEDC_CHANNEL);
 
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, HEADLIGHT_LEDC_CHANNEL, 64));
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, HEADLIGHT_LEDC_CHANNEL,
+                                  headlight_duty_cycle));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, HEADLIGHT_LEDC_CHANNEL));
 
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BRAKELIGHT_LEDC_CHANNEL, 0));
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, BRAKELIGHT_LEDC_CHANNEL,
+                                  brake_light_duty_cycle));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, BRAKELIGHT_LEDC_CHANNEL));
 
-    // --- MCP2515 CAN Controller Initialization
-    // SPI pins: MOSI=13, MISO=12, SCK=14, CS=11
-    // Initialize SPI bus and get device handle
-    spi_device_handle_t spi_handle = spi_mcp2515_init();
-    if (spi_handle == NULL) {
-        ESP_LOGE(TAG, "Failed to initialize SPI for MCP2515");
-        return;
-    }
+    if (boardConfiguration.hardwareFeatureEnable.canbusEnabled) {
+        bool status = false;
+        if (boardConfiguration.hardwareFeatureEnable.useMCP2515) {
+            // SPI pins: MOSI=13, MISO=12, SCK=14, CS=11
+            spi_device_handle_t spi_handle = spi_mcp2515_init();
+            if (spi_handle != NULL) {
+                canBus = new MCP2515_CANController(spi_handle, MCP_8MHZ, MCP_ANY);
+                status = canBus->begin(500000);
+            } else {
+                ESP_LOGE(TAG, "Failed to initialize SPI for MCP2515");
+            }
+        } else {
+            canBus = new ESPCANController(ESP_CANTX, ESP_CANRX);
+            status = canBus->begin(500000);
+        }
 
-    // Create the shared MCP2515 controller with the SPI device handle
-    canBus = new MCP2515_CANController(spi_handle, MCP_8MHZ, MCP_ANY);
-    
-    // Initialize CAN bus: 500 kbps, 8 MHz oscillator, standard/extended ID mode
-    bool status = canBus->begin(500000);
-    if (!status) {
-        ESP_LOGE(TAG, "Failed to initialize MCP2515 CAN controller, status: %d", status);
-        canBus = NULL;
+        if (!status) {
+            ESP_LOGE(TAG, "Failed to initialize %s CAN controller",
+                     boardConfiguration.hardwareFeatureEnable.useMCP2515 ? "MCP2515" : "ESP");
+            delete canBus;
+            canBus = NULL;
+        } else {
+            ESP_LOGI(TAG, "%s CAN controller initialized successfully at 500 kbps",
+                     boardConfiguration.hardwareFeatureEnable.useMCP2515 ? "MCP2515" : "ESP");
+        }
     } else {
-        ESP_LOGI(TAG, "MCP2515 CAN controller initialized successfully at 500 kbps");
-    }
-
-    nvs = new NVSStorage("bms");
-    ESP_ERROR_CHECK(nvs->init());
-
-    esp_err_t board_configuration_err = board_configuration_load(*nvs, boardConfiguration);
-    if (board_configuration_err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to load board configuration: %s", esp_err_to_name(board_configuration_err));
+        ESP_LOGI(TAG, "CAN bus disabled by board configuration");
     }
 
 #if CONFIG_BT_NIMBLE_ENABLED
@@ -1387,10 +1607,15 @@ extern "C" void app_main(void)
     xTaskCreate(board_configuration_task, "board_config", 2048, NULL, 4, NULL);
 
     /* Start sensor and rpm tasks */
-    xTaskCreate(rpm_task, "rpm_task", 4096, &boardConfiguration, 5, NULL);
+    if (boardConfiguration.hardwareFeatureEnable.motorSenseEnable) {
+        xTaskCreate(rpm_task, "rpm_task", 4096, &boardConfiguration, 5, NULL);
+    }
     // ADC sampler runs faster and provides averaged raw ADC values for accessories
     xTaskCreate(adc_sampler_task, "adc_sampler", 2048, NULL, 6, NULL);
     xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+    if (boardConfiguration.hardwareFeatureEnable.tmp117SensorEnabled) {
+        xTaskCreate(tmp117_sensor_task, "tmp117_sensor_task", 2048, NULL, 5, NULL);
+    }
     if (canBus != NULL) {
         xTaskCreate(canbus_task, "canbus_task", 4096, NULL, 5, NULL);
     }

@@ -10,7 +10,7 @@
 #include <cstring>
 
 namespace {
-constexpr uint16_t BOARD_CONFIG_STRUCT_REVISION = 1;
+constexpr uint16_t BOARD_CONFIG_STRUCT_REVISION = 2;
 constexpr size_t BOARD_CONFIGURATION_CRC_OFFSET = offsetof(BoardConfiguration, crc32);
 
 bool parse_uint8(const std::string& command, const char* name, uint8_t& value)
@@ -62,6 +62,10 @@ void print_board_configuration_help()
     console_combiner.writeLine("  motor1 <value>     Set motor 1 pulses per revolution");
     console_combiner.writeLine("  motor2 <value>     Set motor 2 pulses per revolution");
     console_combiner.writeLine("  diameter <value>   Set wheel diameter in 0.1 mm (1050 = 105.0 mm)");
+    console_combiner.writeLine("  voltage_12V <value> Set 12V accessory voltage in millivolts");
+    console_combiner.writeLine("  voltage_5V <value>  Set 5V accessory voltage in millivolts");
+    console_combiner.writeLine("  adc_counts_per_amp_12V <value>  Set 12V ADC counts per amp");
+    console_combiner.writeLine("  adc_counts_per_amp_5V <value>   Set 5V ADC counts per amp");
     console_combiner.writeLine("  uart menu|openocd  Set USB Serial/JTAG mode");
     console_combiner.writeLine("Current values:");
     console_combiner.writeLine("  hardware=" + std::to_string(boardConfiguration.hardwareRevision));
@@ -69,6 +73,10 @@ void print_board_configuration_help()
     console_combiner.writeLine("  motor1=" + std::to_string(boardConfiguration.motorSenseConfiguration.motor1PulsesPerRevolution));
     console_combiner.writeLine("  motor2=" + std::to_string(boardConfiguration.motorSenseConfiguration.motor2PulsesPerRevolution));
     console_combiner.writeLine("  diameter=" + std::to_string(boardConfiguration.wheelSizeMillimeterTenths));
+    console_combiner.writeLine("  voltage_12V=" + std::to_string(boardConfiguration.powerSystemConfiguration.voltage_12V_millivolts));
+    console_combiner.writeLine("  voltage_5V=" + std::to_string(boardConfiguration.powerSystemConfiguration.voltage_5V_millivolts));
+    console_combiner.writeLine("  adc_counts_per_amp_12V=" + std::to_string(boardConfiguration.powerSystemConfiguration.adc_counts_per_amp_12V));
+    console_combiner.writeLine("  adc_counts_per_amp_5V=" + std::to_string(boardConfiguration.powerSystemConfiguration.adc_counts_per_amp_5V));
     console_combiner.writeLine(std::string("  uart=") +
                                (boardConfiguration.uartConfig == STANDARD_MENU ? "menu" : "openocd"));
 }
@@ -152,6 +160,54 @@ void board_configuration_menu_initialize()
             console_combiner.writeLine("Wheel diameter set to " + std::to_string(value) + " tenths of a millimeter");
         }
     });
+    board_configuration_menu.addCommand("voltage_12V", nullptr, [](std::string* command) {
+        uint16_t value = 0;
+        const char* name = "voltage_12V";
+        if (*command == name) {
+            console_combiner.writeLine("Usage: voltage_12V <millivolts> (current: " +
+                                       std::to_string(boardConfiguration.powerSystemConfiguration.voltage_12V_millivolts) + ")");
+        } else if (parse_uint16(*command, name, value)) {
+            boardConfiguration.powerSystemConfiguration.voltage_12V_millivolts = value;
+            mark_board_configuration_stale();
+            console_combiner.writeLine("12V accessory voltage set to " + std::to_string(value) + " millivolts");
+        }
+    });
+    board_configuration_menu.addCommand("voltage_5V", nullptr, [](std::string* command) {
+        uint16_t value = 0;
+        const char* name = "voltage_5V";
+        if (*command == name) {
+            console_combiner.writeLine("Usage: voltage_5V <millivolts> (current: " +
+                                       std::to_string(boardConfiguration.powerSystemConfiguration.voltage_5V_millivolts) + ")");
+        } else if (parse_uint16(*command, name, value)) {
+            boardConfiguration.powerSystemConfiguration.voltage_5V_millivolts = value;
+            mark_board_configuration_stale();
+            console_combiner.writeLine("5V accessory voltage set to " + std::to_string(value) + " millivolts");
+        }
+    });
+    board_configuration_menu.addCommand("adc_counts_per_amp_12V", nullptr, [](std::string* command) {
+        uint16_t value = 0;
+        const char* name = "adc_counts_per_amp_12V";
+        if (*command == name) {
+            console_combiner.writeLine("Usage: adc_counts_per_amp_12V <value> (current: " +
+                                       std::to_string(boardConfiguration.powerSystemConfiguration.adc_counts_per_amp_12V) + ")");
+        } else if (parse_uint16(*command, name, value)) {
+            boardConfiguration.powerSystemConfiguration.adc_counts_per_amp_12V = value;
+            mark_board_configuration_stale();
+            console_combiner.writeLine("12V ADC counts per amp set to " + std::to_string(value));
+        }
+    });
+    board_configuration_menu.addCommand("adc_counts_per_amp_5V", nullptr, [](std::string* command) {
+        uint16_t value = 0;
+        const char* name = "adc_counts_per_amp_5V";
+        if (*command == name) {
+            console_combiner.writeLine("Usage: adc_counts_per_amp_5V <value> (current: " +
+                                       std::to_string(boardConfiguration.powerSystemConfiguration.adc_counts_per_amp_5V) + ")");
+        } else if (parse_uint16(*command, name, value)) {
+            boardConfiguration.powerSystemConfiguration.adc_counts_per_amp_5V = value;
+            mark_board_configuration_stale();
+            console_combiner.writeLine("5V ADC counts per amp set to " + std::to_string(value));
+        }
+    });
     board_configuration_menu.addCommand("uart", nullptr, [](std::string* command) {
         if (*command == "uart") {
             console_combiner.writeLine("Usage: uart menu|openocd (current: " +
@@ -176,6 +232,14 @@ void board_configuration_set_defaults(BoardConfiguration& configuration)
     configuration.motorSenseConfiguration.motor1PulsesPerRevolution = 44;
     configuration.motorSenseConfiguration.motor2PulsesPerRevolution = 44;
     configuration.wheelSizeMillimeterTenths = 1050;
+    configuration.powerSystemConfiguration.voltage_12V_millivolts = 12000;
+    configuration.powerSystemConfiguration.voltage_5V_millivolts = 5000;
+    configuration.powerSystemConfiguration.adc_counts_per_amp_12V = 220;
+    configuration.powerSystemConfiguration.adc_counts_per_amp_5V = 220;
+    configuration.hardwareFeatureEnable.tmp117SensorEnabled = false;
+    configuration.hardwareFeatureEnable.canbusEnabled = true;
+    configuration.hardwareFeatureEnable.useMCP2515 = true;
+    configuration.hardwareFeatureEnable.motorSenseEnable = true;
 }
 
 bool board_configuration_is_valid(const BoardConfiguration& configuration,
