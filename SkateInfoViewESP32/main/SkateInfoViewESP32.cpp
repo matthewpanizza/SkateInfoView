@@ -141,18 +141,18 @@ static uint64_t canalyzer_get_millis()
     return static_cast<uint64_t>(esp_timer_get_time() / 1000);
 }
 
-static void root_menu_on_enter()
+static void root_menu_on_enter(ISerialInterface*)
 {
     console_combiner.writeLine("Welcome to the SkateInfoView configuration menu");
 }
 
 static MenuItem root_menu("root", root_menu_on_enter);
-static void diagnostics_menu_on_enter()
+static void diagnostics_menu_on_enter(ISerialInterface*)
 {
     console_combiner.writeLine("Entered diagnostics menu");
 }
 
-static void canalyzer_menu_on_enter()
+static void canalyzer_menu_on_enter(ISerialInterface*)
 {
     if (canalyzer != nullptr) {
         canalyzer->printHelp();
@@ -160,7 +160,7 @@ static void canalyzer_menu_on_enter()
 }
 
 static MenuItem diagnostics_menu("diagnostics", diagnostics_menu_on_enter);
-static MenuSystem menu_system(&root_menu);
+static MenuSystem menu_system(&root_menu, &console_combiner);
 #endif
 
 // Shared state
@@ -814,7 +814,7 @@ static void add_hardware_feature_alias(MenuItem& menu, std::string name, uint8_t
     add_hardware_feature_command(menu, name, index);
 }
 
-static void hardware_features_menu_on_enter()
+static void hardware_features_menu_on_enter(ISerialInterface*)
 {
     console_combiner.writeLine("Hardware feature toggles:");
     for (uint8_t index = 0; index < 15; ++index) {
@@ -1601,6 +1601,9 @@ extern "C" void app_main(void)
 
     bms = new IntegratedBMS(nvs);
     bms->init(default_battery_config, pack_voltage_mv, pack_idle_current_ma);
+#if CONFIG_BT_NIMBLE_ENABLED
+    root_menu.addCommand("battery", bms->batteryConfigurationMenu(), nullptr);
+#endif
 
     ESP_LOGI(TAG, "BMS initial values %lu", bms->getEnergyRemaining());
 

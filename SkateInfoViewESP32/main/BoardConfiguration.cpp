@@ -81,7 +81,7 @@ void print_board_configuration_help()
                                (boardConfiguration.uartConfig == STANDARD_MENU ? "menu" : "openocd"));
 }
 
-void board_configuration_menu_on_enter()
+void board_configuration_menu_on_enter(ISerialInterface*)
 {
     print_board_configuration_help();
 }
